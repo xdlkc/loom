@@ -1,0 +1,14 @@
+**/.local/
+**/node_modules/
+**/__pycache__/
+**/.DS_Store
+*.log
+*.key
+*.pem
+.env
+.env.*
+!*.example
+*.zip
+screenshots/
+work/
+backups/

@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "本机模型额度同步",
+  "version": "1.2.3",
+  "description": "读取 Grok、指定 Gemini 账号额度与 MiniMax 套餐 Token 消耗。登录态留在 Chrome，不读取 Cookie 或令牌。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzYVfGdxCT55XRjTKgZ1NQrKKLM68DeqngoP9TR0Aq5aLrKvrYa/f2XveNHZEx2FUdKRMMQcPsc8IuLCXJVX4jHIRxXjn4p9Sr5yoCqyuCMNTjcf/V6vgjXv0pJzZb7Tn0h/+/jaLAxSJlZBaizK1RjzoKR7viPYSEzH5kUPw+oJDJkc4Gy5tw1Hg3ABTTpueVLY683G9PvDBDtJBOpOUm7hyzO4EMZ2MlXka/HRVr7MYiXIPZ6sK4LxG/YGLxQFLpW/VL9ycCz3E+J58UA57FTA8co35IkPZW5uxbGkjlHnGOtoyseNxBOIkep3D6ybeypoV0RceH5McKNRVKJ0d0QIDAQAB",
+  "permissions": [
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://grok.com/dashboard/*",
+    "https://gemini.google.com/*",
+    "http://127.0.0.1:4318/*",
+    "https://platform.minimax.cn/*"
+  ],
+  "background": {
+    "service_worker": "service-worker-v120.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://grok.com/dashboard/*"
+      ],
+      "js": [
+        "reader.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "gemini-reader.js",
+        "gemini-content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://platform.minimax.cn/console/usage*"
+      ],
+      "js": [
+        "minimax-reader.js",
+        "minimax-content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup-v120.html"
+  }
+}
