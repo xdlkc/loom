@@ -1,7 +1,7 @@
 import {anthropicEndpoint} from './anthropic.mjs';
 import fs from 'node:fs';import path from 'node:path';import os from 'node:os';import {randomBytes} from 'node:crypto';import {fileURLToPath} from 'node:url';
 export const root=path.dirname(fileURLToPath(import.meta.url));
-export const dataDir=process.env.MODEL_HUB_DATA_DIR||path.join(os.homedir(),'Library/Application Support/ModelHub/.local');
+export const dataDir=process.env.MODEL_HUB_DATA_DIR||path.join(os.homedir(),process.platform==='darwin'?'Library/Application Support/ModelHub/.local':'.local/share/ModelHub/.local');
 export const registryPath=path.join(dataDir,'providers.json');
 export const tokenPath=path.join(dataDir,'hub.key');
 export const baseURL='http://127.0.0.1:4319/v1';
