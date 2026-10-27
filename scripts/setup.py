@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Portable local setup. Never accepts secrets in argv or downloads account data."""
 import argparse,getpass,json,os,pathlib,platform,secrets,shlex,shutil,subprocess,sys,time,urllib.request,plistlib
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
+from node_runtime import ensure_node
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 PRESETS={
  'zenmux':('ZenMux','https://zenmux.ai/api/v1','ZenMux 订阅 / 钱包',['anthropic/claude-sonnet-5.5','anthropic/claude-opus-5.5','anthropic/claude-haiku-5.5']),
@@ -71,7 +73,7 @@ def connect_agents(node,hub,home,registry,backups):
  print('已配置 pi / opencode2；检测到 Claude Code 时同步其菜单。原生登录与权限模式不变。')
 
 def service_config(node,hub,quota,home):
- bindir=home/'.local/bin';path=str(bindir)+os.pathsep+os.environ.get('PATH','/usr/bin:/bin')
+ bindir=home/'.local/bin';path=str(pathlib.Path(node).parent)+os.pathsep+str(bindir)+os.pathsep+os.environ.get('PATH','/usr/bin:/bin')
  return [('local.model-access.hub',hub,'hub.mjs',{'MODEL_HUB_DATA_DIR':str(hub/'.local'),'PATH':path}),('local.model-quota.manager',quota,'server.mjs',{'QUOTA_DATA_DIR':str(quota/'.local'),'MODEL_HUB_DATA_DIR':str(hub/'.local'),'PORT':'4318','PATH':path})]
 def install_services(node,hub,quota,home,start,system):
  for label,cwd,script,env in service_config(node,hub,quota,home):
@@ -91,18 +93,16 @@ def install_services(node,hub,quota,home,start,system):
    if start:subprocess.run(['systemctl','--user','daemon-reload'],check=True);subprocess.run(['systemctl','--user','enable','--now',label+'.service'],check=True);subprocess.run(['systemctl','--user','restart',label+'.service'],check=True)
 
 def main():
- parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--non-interactive',action='store_true',help='安装空服务；不读取凭据、不改 agent 配置');parser.add_argument('--no-start',action='store_true',help='部署并生成启动项，但不启动服务');parser.add_argument('--home',type=pathlib.Path,default=pathlib.Path.home(),help='测试/自定义本机目录，不能与启动服务同时使用');parser.add_argument('--dry-run',action='store_true');args=parser.parse_args()
+ parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--non-interactive',action='store_true',help='安装空服务；不读取凭据、不改 agent 配置');parser.add_argument('--no-start',action='store_true',help='部署并生成启动项，但不启动服务');parser.add_argument('--home',type=pathlib.Path,default=pathlib.Path.home(),help='测试/自定义本机目录，不能与启动服务同时使用');parser.add_argument('--dry-run',action='store_true');parser.add_argument('--no-install-node',action='store_true',help='禁止自动下载专用 Node 运行时');args=parser.parse_args()
  system=platform.system()
  if system not in ['Darwin','Linux']:raise ValueError('当前支持 macOS / Linux；Windows 请使用 WSL2')
  home=args.home.expanduser().resolve()
  if home!=pathlib.Path.home().resolve() and not args.no_start:raise ValueError('--home 必须同时使用 --no-start')
- node=shutil.which('node')
- if not node:raise ValueError('需要 Node.js 24+，请先从 nodejs.org 安装或 brew install node@24')
- node=str(pathlib.Path(node).resolve());version=int(subprocess.check_output([node,'-p','process.versions.node.split(".")[0]'],text=True).strip())
- if version<24:raise ValueError('需要 Node.js 24+；当前 Node 版本过低')
+ node=ensure_node(home,system,dry_run=args.dry_run,auto=not args.no_install_node)
  if not args.non_interactive and not sys.stdin.isatty():raise ValueError('请在交互终端运行，或使用 --non-interactive 部署空服务')
  base=home/('Library/Application Support' if system=='Darwin' else '.local/share');hub=base/'ModelHub';quota=base/'ModelQuotaManager/model-quota-manager'
  if args.dry_run:print('将部署额度面板、模型入口、启动项和本机配置；不读取旧机器数据。');return
+ os.environ['PATH']=str(pathlib.Path(node).parent)+os.pathsep+os.environ.get('PATH','')
  os.umask(0o077);backups=hub/'.local/backups'/('setup-'+time.strftime('%Y%m%d-%H%M%S'))
  for src,dst in [(ROOT/'model-access',hub),(ROOT/'model-quota-manager',quota),(ROOT/'model-access',quota.parent/'model-access')]:
   shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('.local','.git','node_modules','__pycache__','*.log','*.plist'))
@@ -110,9 +110,14 @@ def main():
  registry=configure(hub,quota,not args.non_interactive,backups)
  bin=home/'.local/bin';bin.mkdir(parents=True,exist_ok=True)
  p=bin/'modelhub'
+ marker='# model-quota-manager managed launcher'
  if p.exists() or p.is_symlink():
-  if not p.is_symlink() or p.resolve()!=hub/'model-access.mjs':raise ValueError('modelhub 已被其他程序占用，未覆盖')
- else:p.symlink_to(hub/'model-access.mjs')
+  ours=p.is_symlink() and p.resolve()==hub/'model-access.mjs'
+  if not ours and not p.is_symlink():ours=marker in p.read_text(errors='replace')[:150]
+  if not ours:raise ValueError('modelhub 已被其他程序占用，未覆盖')
+  backup(p,backups)
+  if p.is_symlink():p.unlink()
+ write(p,'#!/bin/sh\n'+marker+'\nexport PATH='+shlex.quote(str(pathlib.Path(node).parent))+':"$PATH"\nexec '+shlex.quote(node)+' '+shlex.quote(str(hub/'model-access.mjs'))+' "$@"\n');p.chmod(0o700)
  (hub/'model-access.mjs').chmod(0o700)
  if not args.non_interactive:connect_agents(node,hub,home,registry,backups)
  install_services(node,hub,quota,home,not args.no_start,system)
@@ -128,7 +133,7 @@ def main():
  print('额度页面：http://127.0.0.1:4318/；模型入口：http://127.0.0.1:4319/v1')
  print('浏览器扩展目录：'+str(quota/'grok-browser-extension'))
  print('首次需要手动加载 Chrome 扩展并绑定 Grok/Gemini/MiniMax/DeepSeek 目标账号。')
- print('Kimi OAuth：node '+shlex.quote(str(quota/'setup-kimi-code.mjs')))
+ print('Kimi OAuth：'+shlex.quote(node)+' '+shlex.quote(str(quota/'setup-kimi-code.mjs')))
  print('Codex：先在官方 CLI 登录，再在网页设置连接本机账号。')
  print('将 ~/.local/bin 加入 PATH，可使用 modelhub add / sync / status。')
  print('重复运行会保留已配置数据；轮换 Key 会确认并备份。初始化不自动发起付费推理。')

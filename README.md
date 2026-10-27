@@ -16,7 +16,7 @@
 
 ## 新机器一键初始化
 
-支持 **macOS / Linux（systemd 用户会话）**；Windows 可在 WSL2 的 Linux 环境使用。先安装 Git、Python 3 和 Node.js 24+（含 npm）。无需 Rust、数据库或额外 npm 项目依赖。
+支持 **macOS / Linux（systemd 用户会话）**；Windows 可在 WSL2 的 Linux 环境使用。先安装 Git 和 Python 3。已有 Node.js 24+ 会直接复用；缺失或版本过低时，向导从 nodejs.org 下载官方 Node 24（含 npm），校验 SHA-256 后安装到工具专用目录，不替换系统 Node。无需 Rust、数据库或额外 npm 项目依赖。
 
 ```sh
 git clone https://github.com/xdlkc/model-quota-manager.git
@@ -48,3 +48,5 @@ python3 -m unittest discover -s tests -v
 ```
 
 本向导已通过隔离目录的首次安装、重复运行、私有权限、两种启动项生成与 agent 配置保留测试；Linux systemd 真机启动尚需在目标机器验证。它不安装浏览器扩展、不自动审批、不绕过登录，也不自动发起付费推理。
+
+专用 Node 运行时位于 `~/.local/share/model-quota-manager/node/`，服务启动项和 `modelhub` 使用其绝对路径；Kimi OAuth 的命令也使用已验证的 Node 路径。下载支持系统代理与 `HTTPS_PROXY`，不关闭 TLS 校验。离线环境可自行安装 Node 24+ 后运行，或用 `--no-install-node` 禁用自动下载。
