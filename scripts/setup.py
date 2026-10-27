@@ -93,12 +93,12 @@ def install_services(node,hub,quota,home,start,system):
    if start:subprocess.run(['systemctl','--user','daemon-reload'],check=True);subprocess.run(['systemctl','--user','enable','--now',label+'.service'],check=True);subprocess.run(['systemctl','--user','restart',label+'.service'],check=True)
 
 def main():
- parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--non-interactive',action='store_true',help='安装空服务；不读取凭据、不改 agent 配置');parser.add_argument('--no-start',action='store_true',help='部署并生成启动项，但不启动服务');parser.add_argument('--home',type=pathlib.Path,default=pathlib.Path.home(),help='测试/自定义本机目录，不能与启动服务同时使用');parser.add_argument('--dry-run',action='store_true');parser.add_argument('--no-install-node',action='store_true',help='禁止自动下载专用 Node 运行时');args=parser.parse_args()
+ parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--non-interactive',action='store_true',help='安装空服务；不读取凭据、不改 agent 配置');parser.add_argument('--no-start',action='store_true',help='部署并生成启动项，但不启动服务');parser.add_argument('--home',type=pathlib.Path,default=pathlib.Path.home(),help='测试/自定义本机目录，不能与启动服务同时使用');parser.add_argument('--dry-run',action='store_true');parser.add_argument('--node-source',choices=['auto','official','npmmirror'],default='auto',help='专用 Node 下载源；auto 在官方连接失败后使用固定校验的备用源');parser.add_argument('--no-install-node',action='store_true',help='禁止自动下载专用 Node 运行时');args=parser.parse_args()
  system=platform.system()
  if system not in ['Darwin','Linux']:raise ValueError('当前支持 macOS / Linux；Windows 请使用 WSL2')
  home=args.home.expanduser().resolve()
  if home!=pathlib.Path.home().resolve() and not args.no_start:raise ValueError('--home 必须同时使用 --no-start')
- node=ensure_node(home,system,dry_run=args.dry_run,auto=not args.no_install_node)
+ node=ensure_node(home,system,dry_run=args.dry_run,auto=not args.no_install_node,source=args.node_source)
  if not args.non_interactive and not sys.stdin.isatty():raise ValueError('请在交互终端运行，或使用 --non-interactive 部署空服务')
  base=home/('Library/Application Support' if system=='Darwin' else '.local/share');hub=base/'ModelHub';quota=base/'ModelQuotaManager/model-quota-manager'
  if args.dry_run:print('将部署额度面板、模型入口、启动项和本机配置；不读取旧机器数据。');return

@@ -50,3 +50,14 @@ python3 -m unittest discover -s tests -v
 本向导已通过隔离目录的首次安装、重复运行、私有权限、两种启动项生成与 agent 配置保留测试；Linux systemd 真机启动尚需在目标机器验证。它不安装浏览器扩展、不自动审批、不绕过登录，也不自动发起付费推理。
 
 专用 Node 运行时位于 `~/.local/share/model-quota-manager/node/`，服务启动项和 `modelhub` 使用其绝对路径；Kimi OAuth 的命令也使用已验证的 Node 路径。下载支持系统代理与 `HTTPS_PROXY`，不关闭 TLS 校验。离线环境可自行安装 Node 24+ 后运行，或用 `--no-install-node` 禁用自动下载。
+
+### Node 官方源连接失败
+
+自动模式会在官方连接失败后改用 npmmirror，并使用仓库内固定的 **Node 官方 SHA-256** 校验 v24.22.1，镜像站的校验清单不会作为信任依据。可直接选择备用源，避免等待官方连接超时：
+
+```sh
+git pull --ff-only
+./setup.sh --node-source npmmirror
+```
+
+`--node-source official` 可禁止备用源。两个源都无法访问时，先配置可用 `HTTPS_PROXY`，或自行安装 Node.js 24+ 再初始化。下载继续使用 HTTPS 证书验证；校验不一致时不会解压或执行安装包。

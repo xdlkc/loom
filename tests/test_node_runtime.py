@@ -20,6 +20,19 @@ class RuntimeTests(unittest.TestCase):
    def download(url,p):p.write_bytes((digest+'  '+top+'.tar.gz\n').encode() if url.endswith('.txt') else blob)
    with unittest.mock.patch.object(runtime.shutil,'which',return_value=None),unittest.mock.patch.object(runtime.platform,'machine',return_value='x86_64'),unittest.mock.patch.object(runtime,'download',side_effect=download) as dl:
     node=runtime.ensure_node(h,'Linux');self.assertTrue(pathlib.Path(node).exists());self.assertEqual(dl.call_count,2);dl.reset_mock();self.assertEqual(runtime.ensure_node(h,'Linux'),node);dl.assert_not_called()
+ def test_official_failure_falls_back_using_pinned_digest(self):
+  with tempfile.TemporaryDirectory() as d:
+   h=pathlib.Path(d);top='node-v24.22.1-linux-x64';archive=h/'fixture.tar.gz'
+   with tarfile.open(archive,'w:gz') as t:
+    data=b'#!/bin/sh\necho 24\n';m=tarfile.TarInfo(top+'/bin/node');m.size=len(data);m.mode=0o755;t.addfile(m,io.BytesIO(data))
+   blob=archive.read_bytes();pin=hashlib.sha256(blob).hexdigest()+'  '+top+'.tar.gz';urls=[]
+   def download(url,p):
+    urls.append(url)
+    if url.startswith(runtime.ORIGIN):raise ValueError('fixture connection failure')
+    p.write_bytes(blob)
+   with unittest.mock.patch.object(runtime.shutil,'which',return_value=None),unittest.mock.patch.object(runtime.platform,'machine',return_value='x86_64'),unittest.mock.patch.object(runtime,'PINNED',pin),unittest.mock.patch.object(runtime,'download',side_effect=download):
+    self.assertTrue(pathlib.Path(runtime.ensure_node(h,'Linux')).exists())
+   self.assertTrue(urls[0].startswith(runtime.ORIGIN));self.assertTrue(urls[1].startswith(runtime.MIRROR))
  def test_checksum_failure_installs_nothing(self):
   with tempfile.TemporaryDirectory() as d:
    h=pathlib.Path(d)
