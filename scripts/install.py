@@ -20,9 +20,11 @@ label='local.model-access.hub'
 if system=='Darwin':
  p=home/'Library/LaunchAgents'/(label+'.plist');p.parent.mkdir(parents=True,exist_ok=True)
  if p.exists():shutil.copy2(p,backup/p.name)
- domain='gui/'+str(os.getuid());subprocess.run(['launchctl','bootout',domain+'/'+label],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+ domain='gui/'+str(os.getuid())
  v={'Label':label,'ProgramArguments':[str(target),'serve'],'WorkingDirectory':str(base),'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':10,'EnvironmentVariables':{'MODEL_HUB_DATA_DIR':str(data),'PATH':str(home/'.local/bin')+':/usr/bin:/bin'},'StandardOutPath':str(data/'rust-service.log'),'StandardErrorPath':str(data/'rust-service-error.log')}
- p.write_bytes(plistlib.dumps(v));p.chmod(0o600);subprocess.run(['launchctl','bootstrap',domain,str(p)],check=True)
+ p.write_bytes(plistlib.dumps(v));p.chmod(0o600)
+ from launchagent import reload_agent
+ reload_agent(domain,label,p)
 else:
  p=home/'.config/systemd/user'/(label+'.service');p.parent.mkdir(parents=True,exist_ok=True)
  if p.exists():shutil.copy2(p,backup/p.name)
