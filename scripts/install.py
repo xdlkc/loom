@@ -3,14 +3,18 @@ import os,pathlib,platform,plistlib,shlex,shutil,subprocess,sys,time,urllib.requ
 home=pathlib.Path.home();system=platform.system()
 if system not in ['Darwin','Linux']:sys.exit('当前服务安装器支持 macOS / Linux')
 base=home/('Library/Application Support/ModelHub' if system=='Darwin' else '.local/share/ModelHub');base.mkdir(parents=True,exist_ok=True,mode=0o700)
-source=pathlib.Path(sys.argv[1]).resolve();target=base/'modelhub';data=base/'.local';data.mkdir(exist_ok=True,mode=0o700)
+source=pathlib.Path(sys.argv[1]).resolve();target=base/'loom';data=base/'.local';data.mkdir(exist_ok=True,mode=0o700)
 backup=data/'backups'/('rust-install-'+str(time.time_ns()));backup.mkdir(parents=True,mode=0o700)
 if target.exists():shutil.copy2(target,backup/'modelhub')
-tmp=base/'modelhub.install-tmp';shutil.copy2(source,tmp);tmp.chmod(0o700);tmp.replace(target)
-launcher=home/'.local/bin/modelhub';launcher.parent.mkdir(parents=True,exist_ok=True)
+tmp=base/'loom.install-tmp';shutil.copy2(source,tmp);tmp.chmod(0o700);tmp.replace(target)
+launcher=home/'.local/bin/loom';launcher.parent.mkdir(parents=True,exist_ok=True)
 if launcher.exists() or launcher.is_symlink():
  shutil.copy2(launcher,backup/'previous-launcher',follow_symlinks=True);launcher.unlink()
 launcher.symlink_to(target)
+alias=home/'.local/bin/modelhub'
+if alias.exists() or alias.is_symlink():
+ shutil.copy2(alias,backup/'previous-modelhub-launcher',follow_symlinks=True);alias.unlink()
+alias.symlink_to(target)
 env=dict(os.environ,MODEL_HUB_DATA_DIR=str(data));subprocess.run([str(target),'init'],env=env,check=True)
 label='local.model-access.hub'
 if system=='Darwin':
@@ -33,6 +37,6 @@ for _ in range(30):
    if json.load(r).get('runtime')=='rust':break
  except Exception:pass
  time.sleep(.3)
-else:sys.exit('Rust 网关未就绪，请在本机检查 rust-service-error.log。额度工具未修改。')
-print('Rust 网关已启动：http://127.0.0.1:4319/v1；无额度面板、无需 Node.js。')
-print('将 ~/.local/bin 加入 PATH。使用 modelhub add / sync / check / status。')
+else:sys.exit('Loom Rust 网关未就绪，请在本机检查 rust-service-error.log。额度工具未修改。')
+print('Loom Rust 网关已启动：http://127.0.0.1:4319/v1；无额度面板、无需 Node.js。')
+print('将 ~/.local/bin 加入 PATH。使用 loom add / sync / check / status（modelhub 兼容别名保留）。')

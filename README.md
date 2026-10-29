@@ -1,4 +1,4 @@
-# ModelHub · Rust 本机统一模型网关
+# Loom
 
 只包含模型统一网关。**不包含额度面板、浏览器扩展、账号用量采集或默认放行脚本。** 不需要 Node.js。
 
@@ -10,18 +10,18 @@
 
 ```sh
 ./setup.sh
-modelhub add          # 交互添加 provider，API Key 隐藏输入
-modelhub sync         # 导出 pi / opencode2，及已有 Claude Code 设置
-modelhub status
+loom add          # 交互添加 provider，API Key 隐藏输入
+loom sync         # 导出 pi / opencode2，及已有 Claude Code 设置
+loom status
 ```
 
 无自启动需求时，直接运行 Rust 二进制：
 
 ```sh
 cargo build --release --locked
-./target/release/modelhub init
-./target/release/modelhub add
-./target/release/modelhub serve
+./target/release/loom init
+./target/release/loom add
+./target/release/loom serve
 ```
 
 服务安装器只操作 `local.model-access.hub`；不会启停额度工具。已有网关配置直接沿用：macOS `~/Library/Application Support/ModelHub/.local`；Linux `~/.local/share/ModelHub/.local`。可通过 `--data-dir` 或 `MODEL_HUB_DATA_DIR` 指定独立目录。升级前备份二进制和启动项。Key 0600、私有目录 0700；不要上传此目录或备份。
@@ -61,9 +61,9 @@ SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段�
 }
 ```
 
-`proxy` 留空直连；需要代理时在本机配置 URL。不要把 Key 放进 URL。`modelhub add` 默认文本、128K 上下文、8K 输出，按厂商实际能力修改。不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
+`proxy` 留空直连；需要代理时在本机配置 URL。不要把 Key 放进 URL。`loom add` 默认文本、128K 上下文、8K 输出，按厂商实际能力修改。不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
 
-`modelhub set-key local-demo` 隐藏输入轮换 Key。`modelhub check` 检查配置及 Key 文件是否存在，不验证推理权限。`sync` 保留无关客户端配置、OAuth 和权限模式，修改前私密备份；不强制改变既有默认模型或接管其他 provider。
+`loom set-key local-demo` 隐藏输入轮换 Key。`loom check` 检查配置及 Key 文件是否存在，不验证推理权限。`sync` 保留无关客户端配置、OAuth 和权限模式，修改前私密备份；不强制改变既有默认模型或接管其他 provider。
 
 ## 验证与发布范围
 
@@ -73,3 +73,5 @@ cargo fmt --check
 ```
 
 本仓库早期历史曾包含额度工具；当前分支只分发 Rust 网关。旧源码可从历史提交恢复，未重写远端历史；本机额度服务保持独立。Rust 版可在独立端口/配置目录验证后，再用安装器迁移运行服务。
+
+项目与命令名称为 **Loom**，仓库为 `xdlkc/loom`。已有 `modelhub` 命令作为兼容别名保留；`hub/` 模型前缀、4319 端口和历史 ModelHub 配置目录不改名，避免现有 agent 和密钥路径失效。

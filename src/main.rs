@@ -5,10 +5,7 @@ use config::Result;
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Local-only model gateway. No quota dashboard or account scraping."
-)]
+#[command(version, about = "Loom — local-only unified model gateway.")]
 struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
@@ -43,7 +40,7 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Init => {
             config::init(&d)?;
-            println!("已初始化本机私有配置。运行 modelhub add 添加 provider；Key 隐藏输入。");
+            println!("已初始化本机私有配置。运行 loom add 添加 provider；Key 隐藏输入。");
         }
         Command::Add => {
             config::init(&d)?;

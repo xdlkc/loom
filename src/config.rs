@@ -207,13 +207,19 @@ pub fn sync(d: &Path, h: &Path) -> Result<()> {
     let mut settings = read_or(&sp)?;
     let mut oc = read_or(&op)?;
     let label = |m: &Model| {
-        format!(
-            "hub/{} · {}",
-            m.m["name"].as_str().unwrap_or(m.m["id"].as_str().unwrap()),
-            m.id.split('/').next().unwrap()
-        )
+        let raw = m.m["name"].as_str().unwrap_or(m.m["id"].as_str().unwrap());
+        let name = raw
+            .split_once(": ")
+            .map(|(_, v)| v)
+            .unwrap_or(raw)
+            .trim_start_matches("Claude ")
+            .trim_start_matches("claude-")
+            .replace("glm-", "GLM ")
+            .replace("DeepSeek-", "DeepSeek ")
+            .replace('-', " ");
+        format!("hub/{name} · {}", m.id.split('/').next().unwrap())
     };
-    pi["providers"]["hub"] = json!({"name":"hub","baseUrl":"http://127.0.0.1:4319/v1","api":"openai-completions","apiKey":format!("!cat {}",quote(&key)),"authHeader":true,"models":models.iter().map(|m|{let mut v=m.m.clone();v["id"]=json!(m.id);v["name"]=json!(label(m));v["compat"]=json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":false,"maxTokensField":"max_tokens","requiresReasoningContentOnAssistantMessages":true});v}).collect::<Vec<_>>()});
+    pi["providers"]["hub"] = json!({"name":"hub","baseUrl":"http://127.0.0.1:4319/v1","api":"openai-completions","apiKey":format!("!cat {}",quote(&key)),"authHeader":true,"models":models.iter().map(|m|{let mut v=m.m.clone();v["id"]=json!(m.id);v["name"]=json!(label(m));v["compat"]=json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":false,"maxTokensField":"max_tokens","requiresReasoningContentOnAssistantMessages":true});if let Some(extra)=m.p["piCompat"].as_object(){v["compat"].as_object_mut().unwrap().extend(extra.clone());}v}).collect::<Vec<_>>()});
     let entries:serde_json::Map<String,Value>=models.iter().map(|m|(m.id.clone(),json!({"name":label(m),"capabilities":{"tools":true,"input":m.m.get("input").cloned().unwrap_or(json!(["text"])),"output":["text"]},"limit":{"context":m.m["contextWindow"].as_u64().unwrap_or(128000),"output":m.m["maxTokens"].as_u64().unwrap_or(8192)}}))).collect();
     oc["providers"]["hub"] = json!({"name":"hub","package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":"http://127.0.0.1:4319/v1","apiKey":format!("{{file:{}}}",key.display())},"models":entries});
     if let Some(enabled) = settings["enabledModels"].as_array() {
@@ -280,7 +286,9 @@ pub fn sync(d: &Path, h: &Path) -> Result<()> {
                     .cloned()
                     .unwrap_or(json!({}));
                 o["model"] = json!(m.id);
-                o["label"] = json!(label(m));
+                if o["label"].is_null() {
+                    o["label"] = json!(label(m));
+                }
                 o["description"] = json!(format!(
                     "{}/{}",
                     m.id.split('/').next().unwrap(),
