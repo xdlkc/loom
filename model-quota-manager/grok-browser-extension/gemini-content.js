@@ -1,5 +1,0 @@
-async function snapshot(){const d=collectGeminiQuota(document,location.href);if(!d)return null;const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(d.accountEmail));delete d.accountEmail;d.accountFingerprint=[...new Uint8Array(bytes)].map(n=>n.toString(16).padStart(2,'0')).join('');return d;}
-async function settle(){let previous='',stable=0;const start=Date.now();while(Date.now()-start<40000){const d=await snapshot();if(d&&d.plan&&document.readyState==='complete'){const sig=JSON.stringify({...d,observedAt:null});stable=sig===previous?stable+1:0;previous=sig;if(stable>=3)return d;}await new Promise(r=>setTimeout(r,1000));}return null;}
-chrome.runtime.onMessage.addListener((message,sender,reply)=>{if(message.type!=='gemini-capture')return;(async()=>reply({snapshot:await settle()}))().catch(()=>reply({snapshot:null}));return true;});
-// A scheduled capture only posts to the background; it accepts data solely from its own temporary tab.
-(async()=>{await new Promise(r=>setTimeout(r,5000));const d=await settle();if(d)await chrome.runtime.sendMessage({type:'gemini-quota',snapshot:d});})().catch(()=>{});
