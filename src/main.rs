@@ -1,5 +1,6 @@
 mod config;
 mod gateway;
+mod install;
 use clap::{Parser, Subcommand};
 use config::Result;
 use serde_json::json;
@@ -15,6 +16,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init,
+    /// Install this binary and user autostart service, preserving local configuration.
+    Install {
+        #[arg(
+            long,
+            help = "Deploy files and generate service configuration without starting it"
+        )]
+        no_start: bool,
+    },
     Serve {
         #[arg(long, default_value_t = 4319)]
         port: u16,
@@ -38,6 +47,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let d = cli.data_dir.unwrap_or_else(config::data_dir);
     match cli.command {
+        Command::Install { no_start } => install::install(d, no_start).await?,
         Command::Init => {
             config::init(&d)?;
             println!("已初始化本机私有配置。运行 loom add 添加 provider；Key 隐藏输入。");

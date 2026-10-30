@@ -6,10 +6,10 @@
 
 ## 安装与启动
 
-需要 [Rust 工具链](https://rustup.rs/)。macOS / Linux 的用户服务安装器额外需要 Python 3：
+从源码构建需要 [Rust 工具链](https://rustup.rs/)。安装、自启动和运行均由 Rust 完成，**不需要 Python 或 Node.js**：
 
 ```sh
-./setup.sh
+./setup.sh           # cargo build --release --locked，再执行 loom install
 loom add          # 交互添加 provider，API Key 隐藏输入
 loom sync         # 导出 pi / opencode2，及已有 Claude Code 设置
 loom status
@@ -70,8 +70,24 @@ SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段�
 ```sh
 cargo test --locked
 cargo fmt --check
+cargo clippy --locked -- -D warnings
 ```
 
 本仓库早期历史曾包含额度工具；当前分支只分发 Rust 网关。旧源码可从历史提交恢复，未重写远端历史；本机额度服务保持独立。Rust 版可在独立端口/配置目录验证后，再用安装器迁移运行服务。
 
 项目与命令名称为 **Loom**，仓库为 `xdlkc/loom`。已有 `modelhub` 命令作为兼容别名保留；`hub/` 模型前缀、4319 端口和历史 ModelHub 配置目录不改名，避免现有 agent 和密钥路径失效。
+
+## Rust 安装器
+
+```sh
+loom install                       # 当前二进制安装到用户目录并配置自启动
+loom install --no-start            # 只部署及生成启动项，不操作正在运行的服务
+```
+
+旧版 Loom 没有 `install` 子命令时，先在源码目录 `git pull --ff-only`，再运行 `./setup.sh`。已构建的独立二进制无需 Rust 工具链即可执行 `install`。安装器使用操作系统自带的 macOS `launchctl` 或 Linux `systemctl --user`，不需要管理员权限；Linux 要有可用的 systemd 用户会话。
+
+安装器保留现有 `providers.json`、入口 Key、上游 Key、客户端设置和 OAuth；配置有误时在停止旧服务前退出。覆盖前将程序、启动项、命令链接信息备份到本机私有目录；启动项加载或健康检查失败会尝试恢复旧文件及原服务，并报告备份位置。首次安装失败会撤销新服务。恢复也失败时需根据该私密备份手动处理，不能承诺系统服务管理器故障时自动恢复一定成功。
+
+macOS 安装会等待旧任务卸载再重试加载，避免错误 5 的清理竞态。只操作网关启动项 `local.model-access.hub`，不操作额度服务。
+
+0.3.0 起安装器为纯 Rust。测试包含 macOS/Linux 启动项生成、卸载等待与重试、安装失败恢复、空 PATH 安装、对已安装二进制自身升级以及原配置/Key 字节不变。Linux systemd 真机启动仍需在目标机器确认。
