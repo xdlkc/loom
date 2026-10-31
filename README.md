@@ -91,3 +91,28 @@ loom install --no-start            # 只部署及生成启动项，不操作正�
 macOS 安装会等待旧任务卸载再重试加载，避免错误 5 的清理竞态。只操作网关启动项 `local.model-access.hub`，不操作额度服务。
 
 0.3.0 起安装器为纯 Rust。测试包含 macOS/Linux 启动项生成、卸载等待与重试、安装失败恢复、空 PATH 安装、对已安装二进制自身升级以及原配置/Key 字节不变。Linux systemd 真机启动仍需在目标机器确认。
+
+## 一条命令更新
+
+从 0.4.0 开始：
+
+```sh
+loom update
+```
+
+自动从 `https://github.com/xdlkc/loom.git` 的 `main` 获取源码，使用 `cargo build --release --locked` 构建，然后由新二进制执行 `loom install`，备份旧版本并重启服务。保留 provider 配置、入口 Key、上游 Key、客户端配置和 OAuth；安装器的健康检查失败时尝试恢复旧版本。更新前后对配置和 Key 做本机内容比对，不打印凭据。
+
+需要本机已安装 Git 和 Rust 1.89+，并具有私有仓库访问权限（GitHub CLI 用户可先执行 `gh auth login`、`gh auth setup-git`）。构建需要访问 crates.io；自动更新不会安装系统依赖，也不需要 Python / Node.js。依赖缺失或网络/构建失败时旧服务保持运行，终端会给出失败阶段。
+
+源码临时目录和编译缓存位于私有配置目录的 `updates/` 中，不使用或修改原来的 Git 工作副本。临时源码在成功或失败后清理，编译缓存保留以加快后续更新；独占文件锁防止同时更新，进程结束后自动释放。只有构建完成且配置/Key 未发生变化时才开始替换；本机设置正在编辑时可能中止更新，重试即可。
+
+0.3.x 或更早版本还没有 `update` 命令，需要最后手动升级一次：
+
+```sh
+cd /path/to/your/loom-checkout
+git remote set-url origin https://github.com/xdlkc/loom.git
+git pull --ff-only
+./setup.sh
+```
+
+此后可在任意目录直接运行 `loom update`。

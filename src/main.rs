@@ -1,6 +1,7 @@
 mod config;
 mod gateway;
 mod install;
+mod update;
 use clap::{Parser, Subcommand};
 use config::Result;
 use serde_json::json;
@@ -16,6 +17,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init,
+    /// Fetch, build, install and restart Loom while preserving local configuration.
+    Update,
     /// Install this binary and user autostart service, preserving local configuration.
     Install {
         #[arg(
@@ -47,6 +50,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let d = cli.data_dir.unwrap_or_else(config::data_dir);
     match cli.command {
+        Command::Update => update::update(&d)?,
         Command::Install { no_start } => install::install(d, no_start).await?,
         Command::Init => {
             config::init(&d)?;
