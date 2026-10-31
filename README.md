@@ -9,10 +9,37 @@
 从源码构建需要 [Rust 工具链](https://rustup.rs/)。安装、自启动和运行均由 Rust 完成，**不需要 Python 或 Node.js**：
 
 ```sh
-./setup.sh           # cargo build --release --locked，再执行 loom install
-loom add          # 交互添加 provider，API Key 隐藏输入
-loom sync         # 导出 pi / opencode2，及已有 Claude Code 设置
+./setup.sh        # 首次交互安装自动进入供应商向导，然后安装并启用自启动
 loom status
+```
+
+首次安装只需回车选择全部，再逐项粘贴 Key（隐藏输入）；没有 Key 就回车跳过。名称、Base URL、计费来源和模型列表自动填好，随后自动同步 pi / opencode2 及已有 Claude Code 设置。已有供应商配置时，安装与更新不再询问 Key，也不会套用预设覆盖原配置。非交互安装不启动向导，安装后在本机终端运行 `loom add`。
+
+## 添加供应商 / 更换 Key
+
+```sh
+loom add                       # 默认全部；也可输入 1,4 等编号多选
+loom add zenmux deepseek        # 只询问这两家的 Key
+loom add kimi                  # 已配置时，输入新 Key 更换；回车保留
+```
+
+`loom configure` 是 `loom add` 的别名。不用填写名称、地址、模型 ID；输入的 Key 不显示、不放进命令参数，不接受管道传入。每家保存后立即落盘，未填 Key 的新供应商不会创建；已存在的供应商只轮换 Key，保留模型、地址、名称、启用状态及其他设置。旧 Key 仅在本机私密备份。重新运行向导可以继续未完成的配置。
+
+| 编号 | 供应商 | 需要的 Key | 自动配置的模型 |
+| --- | --- | --- | --- |
+| 1 | ZenMux | 推理 API Key，非 Management Key | Claude Sonnet / Opus / Haiku 5.5（仅 Claude） |
+| 2 | GLM 国内 Coding Plan | 该套餐的 API Key | GLM 5.3 / Flash / FlashX |
+| 3 | MiniMax 国内订阅 | Subscription Key | MiniMax M3.1 Flash |
+| 4 | DeepSeek API 钱包 | 开放平台 API Key | DeepSeek Flash / V4 Pro |
+| 5 | Kimi Code 国内订阅 | Kimi Code API Key，非 Moonshot Key | K3.1 Pro / Highspeed |
+
+预设是公共接入信息，不代表账号已获所有模型权限；模型权限仍由上游套餐决定，不自动发送付费测试请求。上下文 128K、最大输出 8K、文本输入是保守初始设置，可在中央配置中调整。不同套餐不混用、不跨供应商回退。预设来源：[ZenMux](https://zenmux.ai/docs/guide/quickstart.html)、[GLM Coding Plan](https://docs.bigmodel.cn/cn/coding-plan/quick-start)、[MiniMax](https://platform.minimax.cn/docs/m-plan/quickstart)、[DeepSeek](https://api-docs.deepseek.com/quick_start/pricing-details-cny/)、[Kimi Code](https://www.kimi.com/code/docs/)。
+
+其他供应商、海外站点或 API 钱包独立接入仍可手动配置：
+
+```sh
+loom add --custom              # 高级配置；显示名称默认采用供应商标识
+loom set-key local-zenmux       # 按准确的供应商 ID 隐藏输入更换 Key
 ```
 
 无自启动需求时，直接运行 Rust 二进制：
@@ -61,7 +88,7 @@ SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段�
 }
 ```
 
-`proxy` 留空直连；需要代理时在本机配置 URL。不要把 Key 放进 URL。`loom add` 默认文本、128K 上下文、8K 输出，按厂商实际能力修改。不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
+`proxy` 留空直连；需要代理时在本机配置 URL。不要把 Key 放进 URL。供应商向导只使用公共预设，不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
 
 `loom set-key local-demo` 隐藏输入轮换 Key。`loom check` 检查配置及 Key 文件是否存在，不验证推理权限。`sync` 保留无关客户端配置、OAuth 和权限模式，修改前私密备份；不强制改变既有默认模型或接管其他 provider。
 

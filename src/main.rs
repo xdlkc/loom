@@ -1,11 +1,11 @@
 mod config;
 mod gateway;
 mod install;
+mod onboarding;
 mod update;
 use clap::{Parser, Subcommand};
 use config::Result;
-use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 #[derive(Parser)]
 #[command(version, about = "Loom — local-only unified model gateway.")]
 struct Cli {
@@ -31,7 +31,16 @@ enum Command {
         #[arg(long, default_value_t = 4319)]
         port: u16,
     },
-    Add,
+    /// Choose providers and enter hidden API Keys; names, URLs and models are preset.
+    #[command(alias = "configure")]
+    Add {
+        /// Optional provider names, e.g. zenmux deepseek. Omit to choose interactively.
+        #[arg(value_delimiter = ',', conflicts_with = "custom")]
+        providers: Vec<String>,
+        /// Manually configure an unlisted provider.
+        #[arg(long)]
+        custom: bool,
+    },
     SetKey {
         provider: String,
     },
@@ -51,51 +60,21 @@ async fn run() -> Result<()> {
     let d = cli.data_dir.unwrap_or_else(config::data_dir);
     match cli.command {
         Command::Update => update::update(&d)?,
-        Command::Install { no_start } => install::install(d, no_start).await?,
+        Command::Install { no_start } => {
+            if !no_start
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+                && onboarding::needs_setup(&d)?
+            {
+                onboarding::configure(&d, &[], false)?;
+            }
+            install::install(d, no_start).await?;
+        }
         Command::Init => {
             config::init(&d)?;
-            println!("已初始化本机私有配置。运行 loom add 添加 provider；Key 隐藏输入。");
+            println!("已初始化。运行 loom add，选择供应商并隐藏输入 Key 即可。");
         }
-        Command::Add => {
-            config::init(&d)?;
-            let prefix =
-                config::prompt("Provider 标识（如 zenmux / glm / minimax / deepseek / kimi）")?;
-            let name = config::prompt("显示名称")?;
-            let base = config::endpoint(&config::prompt("OpenAI 兼容 Base URL（HTTPS）")?)?;
-            let native = config::prompt("自定义 Anthropic Base URL（常见厂商可留空）")?;
-            if !native.is_empty() {
-                config::endpoint(&native)?;
-            }
-            let billing = config::prompt("计费来源")?;
-            let ids = config::prompt("Model ID（逗号分隔）")?;
-            let models:Vec<_>=ids.split(',').map(str::trim).filter(|v|!v.is_empty()).map(|id|json!({"id":id,"name":id,"contextWindow":128000,"maxTokens":8192,"input":["text"],"reasoning":false})).collect();
-            if models.is_empty() {
-                return Err("models required".into());
-            }
-            let mut r = config::read(&d.join("providers.json"))?;
-            let pid = format!("local-{prefix}");
-            if r["providers"].get(&pid).is_some() {
-                return Err("provider exists".into());
-            }
-            let kp = d.join("keys").join(format!("{pid}.key"));
-            let mut p = json!({"prefix":prefix,"name":name,"baseURL":base,"billing":billing,"enabled":true,"keyFile":kp,"models":models});
-            if !native.is_empty() {
-                p["anthropicBaseURL"] = json!(native);
-            }
-            r["providers"][&pid] = p;
-            config::catalog(&r)?;
-            let key =
-                rpassword::prompt_password("推理 API Key（隐藏输入，不是 Management Key）: ")?;
-            validate_key(&key)?;
-            if kp.exists() {
-                return Err("key already exists".into());
-            }
-            config::backup(&d.join("providers.json"), &d)?;
-            config::write(&kp, key.trim().as_bytes())?;
-            config::save(&d.join("providers.json"), &r)?;
-            config::sync(&d, &config::home())?;
-            println!("已保存并同步客户端，运行中的会话请刷新模型列表。");
-        }
+        Command::Add { providers, custom } => onboarding::configure(&d, &providers, custom)?,
         Command::SetKey { provider } => {
             let r = config::read(&d.join("providers.json"))?;
             let p = r["providers"].get(&provider).ok_or("provider missing")?;
@@ -180,6 +159,7 @@ fn validate_key(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn safe_urls() {
         for s in ["http://a", "https://user:pass@a", "https://a/?key=x"] {

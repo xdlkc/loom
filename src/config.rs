@@ -135,6 +135,12 @@ pub struct Model {
     pub p: Value,
     pub m: Value,
 }
+pub fn provider_prefix<'a>(pid: &'a str, p: &'a Value) -> &'a str {
+    let short = pid.strip_prefix("local-").unwrap_or(pid);
+    p["prefix"]
+        .as_str()
+        .unwrap_or_else(|| short.strip_suffix("-plan").unwrap_or(short))
+}
 pub fn catalog(r: &Value) -> Result<Vec<Model>> {
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
@@ -144,12 +150,7 @@ pub fn catalog(r: &Value) -> Result<Vec<Model>> {
         }
         endpoint(p["baseURL"].as_str().ok_or("baseURL required")?)?;
         anthropic(p)?;
-        let derived = pid
-            .strip_prefix("local-")
-            .unwrap_or(pid)
-            .strip_suffix("-plan")
-            .unwrap_or(pid.strip_prefix("local-").unwrap_or(pid));
-        let prefix = p["prefix"].as_str().unwrap_or(derived);
+        let prefix = provider_prefix(pid, p);
         if prefix.is_empty()
             || !prefix.as_bytes()[0].is_ascii_lowercase()
             || !prefix
