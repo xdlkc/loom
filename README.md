@@ -27,7 +27,7 @@ loom add kimi                  # 已配置时，输入新 Key 更换；回车保
 
 | 编号 | 供应商 | 需要的 Key | 自动配置的模型 |
 | --- | --- | --- | --- |
-| 1 | ZenMux | 推理 API Key，非 Management Key | Claude Sonnet / Opus / Haiku 5.5（仅 Claude） |
+| 1 | ZenMux | 推理 API Key，非 Management Key | Claude 5.5 系列 + 公共目录中的 Muse Wonder、Ling 3.1 Flash、MiMo V2.6 Flash / Pro |
 | 2 | GLM 国内 Coding Plan | 该套餐的 API Key | GLM 5.3 / Flash / FlashX |
 | 3 | MiniMax 国内订阅 | Subscription Key | MiniMax M3.1 Flash |
 | 4 | DeepSeek API 钱包 | 开放平台 API Key | DeepSeek Flash / V4 Pro |
@@ -91,6 +91,16 @@ SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段�
 `proxy` 留空直连；需要代理时在本机配置 URL。不要把 Key 放进 URL。供应商向导只使用公共预设，不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
 
 `loom set-key local-demo` 隐藏输入轮换 Key。`loom check` 检查配置及 Key 文件是否存在，不验证推理权限。`sync` 保留无关客户端配置、OAuth 和权限模式，修改前私密备份；不强制改变既有默认模型或接管其他 provider。
+
+## 多台机器的模型目录
+
+从 0.6.0 起，[catalog/zenmux.json](catalog/zenmux.json) 随 Loom 一起发布公共模型目录。已有 ZenMux provider（`https://zenmux.ai/api/v1`）在运行时自动补充这些模型；没有配置 ZenMux 的机器不会自动创建 provider。私有 `providers.json` 和 Key 文件仍留在各台机器，不进入仓库，也不会因为更新公共目录而被改写。
+
+其他机器执行 `loom update` 后，新网关会自动把有效目录同步到 pi / opencode2 和已有 Claude Code 设置。不必重新输入 Key 或重新添加 provider；已经打开的 agent 需要退出重开，以加载更新后的模型列表。手动运行 `loom sync` 也使用同一目录，旧版 `loom sync` 只同步本机旧配置，不能获取新版目录。
+
+目前公共目录补充 `meta/muse-wonder-1.0`、`inclusionai/ling-3.1-flash`、`xiaomi/mimo-v2.6-flash` 和 `xiaomi/mimo-v2.6-pro`，均已核对 ZenMux 的 Chat Completions / Messages 适配。来源：[ZenMux 公共目录](https://zenmux.ai/api/v1/models)、[模型及协议目录](https://zenmux.ai/api/frontend/model/available/list)。Clef Omni 只支持 Decisions API，当前不作为聊天模型发布。
+
+本机 `models` 中同 ID 的条目始终优先，名称、上下文、输出上限、停用状态和默认模型均保留。隐藏一个公共模型时，在该 provider 的 `models` 中加入相应 ID 和 `"enabled": false`；只从本机数组删除条目会重新显示公共默认值。若希望完全自行维护该供应商的模型列表，在 provider 上设置 `"includeBundledModels": false`。自定义端点不自动套用 ZenMux 公共目录。
 
 ## 验证与发布范围
 

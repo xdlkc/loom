@@ -162,7 +162,9 @@ pub fn catalog(r: &Value) -> Result<Vec<Model>> {
         if p["keyFile"].as_str().is_none() {
             return Err("keyFile required".into());
         }
-        for m in p["models"].as_array().ok_or("models required")? {
+        let mut models = p["models"].as_array().ok_or("models required")?.clone();
+        crate::bundled::supplement(p, &mut models)?;
+        for m in &models {
             if m["enabled"] == false {
                 continue;
             }

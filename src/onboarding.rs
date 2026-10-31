@@ -404,12 +404,13 @@ mod tests {
                 .len(),
             3
         );
-        assert!(
+        assert_eq!(
             config::catalog(&r)
                 .unwrap()
                 .iter()
                 .filter(|m| m.id.starts_with("zenmux/"))
-                .all(|m| m.id.contains("/claude-"))
+                .count(),
+            7
         );
         assert!(!io.output.contains("ZENMUX_FIXTURE"));
         for file in [
@@ -448,7 +449,7 @@ mod tests {
         .unwrap();
         let r = config::read(&t.path().join("providers.json")).unwrap();
         let catalog = config::catalog(&r).unwrap();
-        assert_eq!(catalog.len(), 11);
+        assert_eq!(catalog.len(), 15);
         for m in catalog {
             assert!(config::anthropic(&m.p).unwrap().is_some());
         }

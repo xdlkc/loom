@@ -1,3 +1,4 @@
+mod bundled;
 mod config;
 mod gateway;
 mod install;
