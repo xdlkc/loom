@@ -1,8 +1,11 @@
+mod admin;
 mod bundled;
 mod config;
 mod gateway;
+mod harness;
 mod install;
 mod onboarding;
+mod telemetry;
 mod update;
 use clap::{Parser, Subcommand};
 use config::Result;
@@ -30,6 +33,13 @@ enum Command {
     },
     Serve {
         #[arg(long, default_value_t = 4319)]
+        port: u16,
+        #[arg(long)]
+        admin_port: Option<u16>,
+    },
+    /// Open the local management console with a one-use browser login ticket.
+    Console {
+        #[arg(long, default_value_t = 4320)]
         port: u16,
     },
     /// Choose providers and enter hidden API Keys; names, URLs and models are preset.
@@ -61,6 +71,7 @@ async fn run() -> Result<()> {
     let d = cli.data_dir.unwrap_or_else(config::data_dir);
     match cli.command {
         Command::Update => update::update(&d)?,
+        Command::Console { port } => admin::open_console(&d, port).await?,
         Command::Install { no_start } => {
             if !no_start
                 && std::io::stdin().is_terminal()
@@ -113,7 +124,7 @@ async fn run() -> Result<()> {
             }
             println!("配置有效，{} 个模型；不输出 Key。", models.len());
         }
-        Command::Serve { port } => {
+        Command::Serve { port, admin_port } => {
             config::init(&d)?;
             let bind = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
             let sync_dir = d.clone();
@@ -122,7 +133,7 @@ async fn run() -> Result<()> {
                 loop {
                     if let Ok(raw) = tokio::fs::read(sync_dir.join("providers.json")).await
                         && raw != last
-                        && config::sync(&sync_dir, &config::home()).is_ok()
+                        && config::sync_for_port(&sync_dir, &config::home(), port).is_ok()
                     {
                         last = raw;
                     }
@@ -130,9 +141,40 @@ async fn run() -> Result<()> {
                 }
             });
             println!("本机模型网关：http://127.0.0.1:{port}/v1");
+            let telemetry = telemetry::Store::open(&d)?;
+            let admin_bind = tokio::net::TcpListener::bind((
+                std::net::Ipv4Addr::LOCALHOST,
+                admin_port.unwrap_or(port.checked_add(1).unwrap_or(0)),
+            ))
+            .await?;
+            let admin_port = admin_bind.local_addr()?.port();
+            println!("本机管控台：http://127.0.0.1:{admin_port}/；运行 loom console 安全登录。");
+            let admin_app = admin::App::new(d.clone(), telemetry.clone(), admin_port);
+            tokio::spawn(async move {
+                let _ = axum::serve(admin_bind, admin::router(admin_app)).await;
+            });
+            let imports = telemetry.clone();
+            let import_dir = d.clone();
+            let import_home = config::home();
+            tokio::spawn(async move {
+                loop {
+                    let store = imports.clone();
+                    let data = import_dir.clone();
+                    let home = import_home.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if store.setting("import_sessions", serde_json::json!(true)) == true {
+                            let _ = harness::import(&store, &home, &data);
+                        }
+                        let _ = store.retention();
+                    })
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
             axum::serve(
                 bind,
                 gateway::router(gateway::App {
+                    telemetry: Some(telemetry),
                     #[cfg(test)]
                     upstream_override: None,
                     dir: d,

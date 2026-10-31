@@ -189,6 +189,9 @@ fn quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
 pub fn sync(d: &Path, h: &Path) -> Result<()> {
+    sync_for_port(d, h, 4319)
+}
+pub fn sync_for_port(d: &Path, h: &Path, port: u16) -> Result<()> {
     let models = catalog(&read(&d.join("providers.json"))?)?;
     if models.is_empty() {
         return Err("add a provider first".into());
@@ -222,9 +225,9 @@ pub fn sync(d: &Path, h: &Path) -> Result<()> {
             .replace('-', " ");
         format!("hub/{name} · {}", m.id.split('/').next().unwrap())
     };
-    pi["providers"]["hub"] = json!({"name":"hub","baseUrl":"http://127.0.0.1:4319/v1","api":"openai-completions","apiKey":format!("!cat {}",quote(&key)),"authHeader":true,"models":models.iter().map(|m|{let mut v=m.m.clone();v["id"]=json!(m.id);v["name"]=json!(label(m));v["compat"]=json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":false,"maxTokensField":"max_tokens","requiresReasoningContentOnAssistantMessages":true});if let Some(extra)=m.p["piCompat"].as_object(){v["compat"].as_object_mut().unwrap().extend(extra.clone());}v}).collect::<Vec<_>>()});
+    pi["providers"]["hub"] = json!({"name":"hub","baseUrl":format!("http://127.0.0.1:{port}/v1"),"api":"openai-completions","apiKey":format!("!cat {}",quote(&key)),"authHeader":true,"models":models.iter().map(|m|{let mut v=m.m.clone();v["id"]=json!(m.id);v["name"]=json!(label(m));v["compat"]=json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":false,"maxTokensField":"max_tokens","requiresReasoningContentOnAssistantMessages":true});if let Some(extra)=m.p["piCompat"].as_object(){v["compat"].as_object_mut().unwrap().extend(extra.clone());}v}).collect::<Vec<_>>()});
     let entries:serde_json::Map<String,Value>=models.iter().map(|m|(m.id.clone(),json!({"name":label(m),"capabilities":{"tools":true,"input":m.m.get("input").cloned().unwrap_or(json!(["text"])),"output":["text"]},"limit":{"context":m.m["contextWindow"].as_u64().unwrap_or(128000),"output":m.m["maxTokens"].as_u64().unwrap_or(8192)}}))).collect();
-    oc["providers"]["hub"] = json!({"name":"hub","package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":"http://127.0.0.1:4319/v1","apiKey":format!("{{file:{}}}",key.display())},"models":entries});
+    oc["providers"]["hub"] = json!({"name":"hub","package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":format!("http://127.0.0.1:{port}/v1"),"apiKey":format!("{{file:{}}}",key.display())},"models":entries});
     if let Some(enabled) = settings["enabledModels"].as_array() {
         let mut list: Vec<Value> = enabled
             .iter()
@@ -250,6 +253,28 @@ pub fn sync(d: &Path, h: &Path) -> Result<()> {
     {
         oc["model"] = json!(format!("hub/{fallback}"));
     }
+    let pi_extension = h.join(".pi/agent/extensions/loom-observability.ts");
+    let oc_plugin = h.join(".config/opencode/plugins/loom-observability");
+    for (file, source) in [
+        (&pi_extension, include_str!("../integrations/pi.ts")),
+        (
+            &oc_plugin.join("index.ts"),
+            include_str!("../integrations/opencode2.ts"),
+        ),
+    ] {
+        if std::fs::read_to_string(file).ok().as_deref() != Some(source) {
+            backup(file, d)?;
+            write(file, source.as_bytes())?;
+        }
+    }
+    let mut plugins = oc["plugins"].as_array().cloned().unwrap_or_default();
+    if !plugins
+        .iter()
+        .any(|p| p.as_str() == oc_plugin.to_str() || p["package"].as_str() == oc_plugin.to_str())
+    {
+        plugins.push(json!({"package":oc_plugin,"options":{}}));
+    }
+    oc["plugins"] = json!(plugins);
     for (p, v) in [(&pp, &pi), (&sp, &settings), (&op, &oc)] {
         if read_or(p)? != *v {
             backup(p, d)?;
@@ -260,7 +285,7 @@ pub fn sync(d: &Path, h: &Path) -> Result<()> {
     if cp.exists() {
         let mut c = read(&cp)?;
         c["apiKeyHelper"] = json!(format!("cat {}", quote(&key)));
-        c["env"]["ANTHROPIC_BASE_URL"] = json!("http://127.0.0.1:4319");
+        c["env"]["ANTHROPIC_BASE_URL"] = json!(format!("http://127.0.0.1:{port}"));
         c["env"]["ANTHROPIC_API_KEY"] = json!("");
         c["env"]["ANTHROPIC_AUTH_TOKEN"] = json!("");
         let native: Vec<_> = models

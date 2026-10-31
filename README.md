@@ -1,6 +1,6 @@
 # Loom
 
-只包含模型统一网关。**不包含额度面板、浏览器扩展、账号用量采集或默认放行脚本。** 不需要 Node.js。
+包含 Rust 模型统一网关和本机可观测管控台。**不包含额度面板、浏览器扩展、账号用量采集或默认放行脚本。** 不需要 Node.js。
 
 统一访问 OpenAI Chat Completions 与 Anthropic Messages；上游 Key 保存在本机，agent 只引用入口 Key。固定回环监听，拒绝浏览器跨站请求，不跨 provider 回退、不自动重试生成。
 
@@ -64,7 +64,7 @@ cargo build --release --locked
 
 SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段原样透传，不转换思考强度。`max_tokens` 受中央模型输出上限约束。上游不支持的参数可能报错。仅支持上述推理接口，不声明支持整个 Anthropic 平台或自动审批服务。
 
-原生 Anthropic 路由已映射 ZenMux、GLM Coding Plan、MiniMax、DeepSeek、Kimi Code；自定义 provider 可配置 `anthropicBaseURL`。只接受 HTTPS 上游、不跟随重定向；请求正文和 Key 不写日志。每次请求重新读取配置；本机配置变化时自动更新客户端目录。运行中的客户端可能需重启或刷新列表。
+原生 Anthropic 路由已映射 ZenMux、GLM Coding Plan、MiniMax、DeepSeek、Kimi Code；自定义 provider 可配置 `anthropicBaseURL`。只接受 HTTPS 上游、不跟随重定向；请求正文可按采集设置保存于本机私有数据库；Key 与认证头不进入观测数据，也不写程序输出。每次请求重新读取配置；本机配置变化时自动更新客户端目录。运行中的客户端可能需重启或刷新列表。
 
 ## 中央配置
 
@@ -153,3 +153,24 @@ git pull --ff-only
 ```
 
 此后可在任意目录直接运行 `loom update`。
+
+
+## 本机可观测与会话管控（0.7.0）
+
+```sh
+loom update                 # 更新并重启；已有配置与密钥保留
+loom console                # 安全打开本机管控台，不输出入口 Key 或登录票据
+```
+
+网关仍在 `127.0.0.1:4319`，管控台使用独立的 `127.0.0.1:4320`。首次打开请使用 `loom console`；浏览器以一次性票据换取 HttpOnly / SameSite 会话，刷新页面不必重新输入 Key，重启服务后需重新登录。不开放 CORS，不支持公网监听，不改变现有 agent 审批模式。
+
+- **概览**：供应商 / 模型 / harness / 时间筛选，输入与输出 Token 曲线、缓存读写、Token 加权命中率、首 Token 延迟、请求耗时 P50 / P95、成功与异常。缺失 usage 显示未知；reasoning 是输出细分，不二次相加。厂商订阅剩余百分比、API 钱包余额与真实 Token 消耗不混用，也不将未知美元费用显示为零。
+- **请求**：每个调用的接收、认证、路由、请求准备、上游响应、首字节、首 Token、完成阶段；客户端请求、上游转发参数、响应 / SSE、错误、取消与不完整状态。点击关联会话可继续下钻。
+- **会话轨迹**：只读导入 pi / Claude Code 的 JSONL，以及 opencode2 V2 的 SQLite（兼容 V1 message / part）；保留消息、工具输入、工具结果、分支 parent ID、压缩与其他原生事件。支持搜索与分页；完整事件 JSON 可展开。原生文件未保留的会话只能展示网关请求，不能恢复已丢失的工具记录。历史导入不会混入全局网关计量，避免重复计数。
+- **采集设置**：分别控制请求 / 响应正文和原生会话导入，保留期默认为 30 天（1–3650 天），后台每 15 秒检查原生轨迹并清理到期副本。清理不修改 harness 原始文件。关闭正文采集只影响之后的请求，已有副本按保留期清理。
+
+`loom sync` / 网关启动会部署仅用于关联的本机 pi 扩展和 opencode2 V2 插件，并保留原有插件、OAuth、默认模型及权限设置。pi 使用官方 `before_provider_headers`；OpenCode V2 使用 `ctx.session.hook("http.request")`；只向本机 hub 请求附加 session 标识，网关不再转发这些标识。Claude Code 从原生请求 metadata / transcript 响应 ID 精确关联。导入默认路径为 `~/.pi/agent/sessions`、`~/.claude/projects`、`~/.local/share/opencode/opencode.db`（或 `opencode2`）；当前用户自定义的其他存储根目录不自动扫描。
+
+观测数据位于原私有数据目录下 `observability/traces.sqlite3`（文件 0600、目录 0700）。完整轨迹可能包含代码、提示词与工具输出；只保存在本机，先移除已知入口 / 上游凭据、认证字段及常见 token 模式，不上传仓库或厂商。程序输出只记录安全状态。正文的观测副本上限为每响应 16 MiB；超过上限显式标注截断，不影响原始推理字节透传。会话和请求不会凭提示词相似度猜测关联。
+
+从源码构建 SQLite bundled 依赖需要 C 编译器（macOS Xcode Command Line Tools，Linux `cc`）；Loom 安装与运行仍不需要 Python / Node.js。内置 TS 适配器由对应 harness 自己加载。调研、指标口径和验收范围见 [docs/observability.md](docs/observability.md)。

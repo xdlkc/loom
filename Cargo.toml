@@ -1,6 +1,6 @@
 [package]
 name = "loom"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Local-only unified model gateway"
@@ -17,6 +17,10 @@ subtle = "2"
 rpassword = "7"
 futures-util = "0.3"
 async-stream = "0.3"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+sha2 = "0.11.1"
+regex = "1.13.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

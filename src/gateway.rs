@@ -1,4 +1,5 @@
 use crate::config::{self, Result};
+use crate::telemetry::{Flight, Store};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -13,6 +14,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 #[derive(Clone)]
 pub struct App {
+    pub telemetry: Option<Store>,
     #[cfg(test)]
     pub upstream_override: Option<String>,
     pub dir: PathBuf,
@@ -36,6 +38,12 @@ fn err(native: bool, status: u16, code: &str) -> Response {
         }),
     )
         .into_response()
+}
+fn recorded_error(trace: &mut Option<Flight>, native: bool, status: u16, code: &str) -> Response {
+    if let Some(t) = trace {
+        t.fail(status, code);
+    }
+    err(native, status, code)
 }
 fn header<'a>(h: &'a HeaderMap, k: &str) -> Option<&'a str> {
     h.get(k).and_then(|v| v.to_str().ok())
@@ -133,20 +141,35 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         return Json(json!({"ok":true,"service":"local-model-hub","runtime":"rust"}))
             .into_response();
     }
+    let mut trace = if req.method() == "POST" {
+        app.telemetry.clone().map(|store| {
+            Flight::start(
+                store,
+                &app.dir,
+                &h,
+                if native { "anthropic" } else { "openai" },
+            )
+        })
+    } else {
+        None
+    };
     let key = match tokio::fs::read_to_string(app.dir.join("hub.key")).await {
         Ok(v) => v,
-        Err(_) => return err(native, 503, "LOCAL_KEY_UNAVAILABLE"),
+        Err(_) => return recorded_error(&mut trace, native, 503, "LOCAL_KEY_UNAVAILABLE"),
     };
     if !auth(&h, key.trim(), native) {
-        return err(native, 401, "LOCAL_KEY_REQUIRED");
+        return recorded_error(&mut trace, native, 401, "LOCAL_KEY_REQUIRED");
+    }
+    if let Some(t) = &mut trace {
+        t.stage("authenticated");
     }
     let registry = match config::read(&app.dir.join("providers.json")) {
         Ok(v) => v,
-        Err(_) => return err(native, 503, "REGISTRY_INVALID"),
+        Err(_) => return recorded_error(&mut trace, native, 503, "REGISTRY_INVALID"),
     };
     let models = match config::catalog(&registry) {
         Ok(v) => v,
-        Err(_) => return err(native, 503, "REGISTRY_INVALID"),
+        Err(_) => return recorded_error(&mut trace, native, 503, "REGISTRY_INVALID"),
     };
     if path == "/v1/models" && req.method() == "GET" {
         let data:Vec<_>=models.iter().filter(|m|!native||config::anthropic(&m.p).ok().flatten().is_some()).map(|m|if native{json!({"id":m.id,"type":"model","display_name":m.m["name"],"created_at":"1970-01-01T00:00:00Z"})}else{json!({"id":m.id,"object":"model","owned_by":m.p["name"],"name":m.m["name"],"billing":m.p["billing"],"context_window":m.m["contextWindow"],"max_output_tokens":m.m["maxTokens"]})}).collect();
@@ -155,14 +178,14 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     let messages = path == "/v1/messages";
     if !["/v1/messages", "/v1/chat/completions"].contains(&path.as_str()) || req.method() != "POST"
     {
-        return err(native, 404, "ENDPOINT_NOT_SUPPORTED");
+        return recorded_error(&mut trace, native, 404, "ENDPOINT_NOT_SUPPORTED");
     }
     if !header(&h, "content-type").is_some_and(|s| s.starts_with("application/json")) {
-        return err(native, 415, "JSON_REQUIRED");
+        return recorded_error(&mut trace, native, 415, "JSON_REQUIRED");
     }
     let permit = match app.permits.clone().try_acquire_owned() {
         Ok(v) => v,
-        Err(_) => return err(native, 429, "LOCAL_CONCURRENCY_LIMIT"),
+        Err(_) => return recorded_error(&mut trace, native, 429, "LOCAL_CONCURRENCY_LIMIT"),
     };
     let raw = match tokio::time::timeout(
         Duration::from_secs(30),
@@ -171,28 +194,41 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     .await
     {
         Ok(Ok(v)) => v,
-        _ => return err(native, 413, "REQUEST_TOO_LARGE_OR_TIMEOUT"),
+        _ => return recorded_error(&mut trace, native, 413, "REQUEST_TOO_LARGE_OR_TIMEOUT"),
     };
     let mut body: Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
-        Err(_) => return err(native, 400, "INVALID_JSON"),
+        Err(_) => return recorded_error(&mut trace, native, 400, "INVALID_JSON"),
     };
+    if let Some(t) = &mut trace {
+        t.request_body(&body);
+    }
     let route = match models.iter().find(|m| body["model"] == m.id) {
         Some(v) => v,
-        None => return err(native, 400, "UNKNOWN_MODEL"),
+        None => return recorded_error(&mut trace, native, 400, "UNKNOWN_MODEL"),
     };
     if !body["messages"].as_array().is_some_and(|a| !a.is_empty())
         || body.get("stream").is_some_and(|v| !v.is_boolean())
     {
-        return err(native, 400, "INVALID_CHAT_REQUEST");
+        return recorded_error(&mut trace, native, 400, "INVALID_CHAT_REQUEST");
     }
     if messages && normalize(&mut body).is_err() {
-        return err(native, 400, "INVALID_MESSAGES_REQUEST");
+        return recorded_error(&mut trace, native, 400, "INVALID_MESSAGES_REQUEST");
+    }
+    if let Some(t) = &mut trace {
+        t.stage("routed");
     }
     let url = if messages {
         match config::anthropic(&route.p) {
             Ok(Some(v)) => v,
-            _ => return err(native, 400, "ANTHROPIC_NOT_SUPPORTED_BY_PROVIDER"),
+            _ => {
+                return recorded_error(
+                    &mut trace,
+                    native,
+                    400,
+                    "ANTHROPIC_NOT_SUPPORTED_BY_PROVIDER",
+                );
+            }
         }
     } else {
         format!(
@@ -211,7 +247,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     let n = match requested {
         Some(v) => match v.as_u64() {
             Some(n) if n > 0 => n,
-            _ => return err(native, 400, "INVALID_MAX_TOKENS"),
+            _ => return recorded_error(&mut trace, native, 400, "INVALID_MAX_TOKENS"),
         },
         None => max,
     };
@@ -221,9 +257,17 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     body.as_object_mut()
         .unwrap()
         .remove("max_completion_tokens");
+    if let Some(t) = &mut trace {
+        let provider = registry["providers"]
+            .as_object()
+            .and_then(|p| p.iter().find(|(_, p)| **p == route.p))
+            .map(|(id, _)| id.as_str())
+            .unwrap_or("unknown");
+        t.forwarded(provider, &body);
+    }
     let upstream_key = match tokio::fs::read_to_string(route.p["keyFile"].as_str().unwrap()).await {
         Ok(v) => v,
-        Err(_) => return err(native, 503, "PROVIDER_KEY_UNAVAILABLE"),
+        Err(_) => return recorded_error(&mut trace, native, 503, "PROVIDER_KEY_UNAVAILABLE"),
     };
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -233,12 +277,12 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     if let Some(proxy) = registry["proxy"].as_str().filter(|v| !v.is_empty()) {
         builder = match reqwest::Proxy::all(proxy) {
             Ok(p) => builder.proxy(p),
-            Err(_) => return err(native, 503, "PROXY_INVALID"),
+            Err(_) => return recorded_error(&mut trace, native, 503, "PROXY_INVALID"),
         };
     }
     let client = match builder.build() {
         Ok(v) => v,
-        Err(_) => return err(native, 503, "UPSTREAM_UNAVAILABLE"),
+        Err(_) => return recorded_error(&mut trace, native, 503, "UPSTREAM_UNAVAILABLE"),
     };
     let streaming = body["stream"] == true;
     let mut request = client.post(url).json(&body).header(
@@ -256,7 +300,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     if messages {
         let version = header(&h, "anthropic-version").unwrap_or("2023-06-01");
         if version != "2023-06-01" {
-            return err(native, 400, "INVALID_ANTHROPIC_HEADERS");
+            return recorded_error(&mut trace, native, 400, "INVALID_ANTHROPIC_HEADERS");
         }
         request = request.header("anthropic-version", version);
         if let Some(beta) = header(&h, "anthropic-beta") {
@@ -266,23 +310,72 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"_,.-".contains(&b))
             {
-                return err(native, 400, "INVALID_ANTHROPIC_HEADERS");
+                return recorded_error(&mut trace, native, 400, "INVALID_ANTHROPIC_HEADERS");
             }
             request = request.header("anthropic-beta", beta);
         }
     }
-    let response = match request.send().await {
+    if let Some(t) = &mut trace {
+        t.stage("dispatch");
+    }
+    let mut response = match request.send().await {
         Ok(v) => v,
-        Err(_) => return err(native, 502, "UPSTREAM_UNAVAILABLE"),
+        Err(_) => return recorded_error(&mut trace, native, 502, "UPSTREAM_UNAVAILABLE"),
     };
+    if let Some(t) = &mut trace {
+        t.headers(response.status().as_u16());
+    }
     if !response.status().is_success() {
         let s = response.status().as_u16();
-        return err(native, s, &format!("UPSTREAM_{s}"));
+        if let Some(t) = &mut trace {
+            let mut bytes = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(2), async {
+                while let Ok(Some(chunk)) = response.chunk().await {
+                    let count = (16384 - bytes.len()).min(chunk.len());
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.len() >= 16384 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            let upstream = serde_json::from_slice::<Value>(&bytes)
+                .unwrap_or_else(|_| json!({"non_json":true,"captured_bytes":bytes.len()}));
+            t.error_response(json!({"upstream_error":upstream,"client_error":format!("UPSTREAM_{s}"),"error_body_incomplete":read.is_err()||bytes.len()>=16384}));
+        }
+        return recorded_error(&mut trace, native, s, &format!("UPSTREAM_{s}"));
     }
+    let request_id = trace
+        .as_ref()
+        .map(|t| t.record.id.clone())
+        .unwrap_or_default();
     let mut bytes = response.bytes_stream();
-    let stream = async_stream::stream! {let _permit=permit;let mut total=0usize;while let Some(chunk)=bytes.next().await{match chunk{Ok(chunk)=>{total+=chunk.len();if total>64*1024*1024{yield Err(std::io::Error::other("response too large"));break;}yield Ok(chunk);},Err(_)=>{yield Err(std::io::Error::other("upstream stream failed"));break;}}}};
+    let stream = async_stream::stream! {
+        let _permit=permit;
+        let mut trace=trace;
+        let mut total=0usize;
+        while let Some(chunk)=bytes.next().await {
+            match chunk {
+                Ok(chunk)=> {
+                    total+=chunk.len();
+                    if total>64*1024*1024 {
+                        if let Some(t)=&mut trace {t.finish(Some("RESPONSE_SIZE_LIMIT"));}
+                        yield Err(std::io::Error::other("response too large"));break;
+                    }
+                    if let Some(t)=&mut trace {t.chunk(&chunk);}
+                    yield Ok(chunk);
+                },
+                Err(_)=> {
+                    if let Some(t)=&mut trace {t.finish(Some("UPSTREAM_STREAM_ERROR"));}
+                    yield Err(std::io::Error::other("upstream stream failed"));break;
+                }
+            }
+        }
+        if let Some(t)=&mut trace {t.finish(None);}
+    };
     Response::builder()
         .status(200)
+        .header("x-loom-request-id", request_id)
         .header(
             "content-type",
             if streaming {
@@ -296,6 +389,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         .body(Body::from_stream(stream))
         .unwrap()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +415,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         config::init(d.path()).unwrap();
         let app = router(App {
+            telemetry: None,
             upstream_override: None,
             dir: d.path().into(),
             port: 4319,
@@ -376,6 +471,7 @@ mod tests {
         let addr = bind.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(bind, upstream).await.unwrap() });
         let app = router(App {
+            telemetry: None,
             upstream_override: Some(format!("http://{addr}/")),
             dir: d.path().into(),
             port: 4319,
@@ -396,5 +492,64 @@ mod tests {
         let tail = stream.next().await.unwrap().unwrap();
         assert!(String::from_utf8_lossy(&tail).contains("message_stop"));
         task.abort();
+    }
+    #[tokio::test]
+    async fn observes_real_stream_without_altering_bytes_and_keeps_usage_tail() {
+        let d = tempfile::tempdir().unwrap();
+        config::init(d.path()).unwrap();
+        let keyfile = d.path().join("upstream.key");
+        config::write(&keyfile, b"UPSTREAM_FIXTURE").unwrap();
+        config::save(&d.path().join("providers.json"),&json!({"providers":{"local-test":{"prefix":"test","name":"Test","enabled":true,"baseURL":"https://provider.invalid/v1","keyFile":keyfile,"models":[{"id":"coder","maxTokens":128}]}}})).unwrap();
+        let wire = "data: {\"id\":\"response_fixture\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\ndata: [DONE]\n\n";
+        let upstream = Router::new().route(
+            "/",
+            post(move |h: HeaderMap| async move {
+                assert_eq!(header(&h, "authorization"), Some("Bearer UPSTREAM_FIXTURE"));
+                assert!(!h.contains_key("x-loom-session-id"));
+                let parts = wire
+                    .as_bytes()
+                    .chunks(3)
+                    .map(|v| Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(v)))
+                    .collect::<Vec<_>>();
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(parts)))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let store = Store::open(d.path()).unwrap();
+        let app = router(App {
+            telemetry: Some(store.clone()),
+            upstream_override: Some(format!("http://{addr}/")),
+            dir: d.path().into(),
+            port: 4319,
+            permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        });
+        let key = std::fs::read_to_string(d.path().join("hub.key")).unwrap();
+        let req=Request::builder().method("POST").uri("/v1/chat/completions").header("host","127.0.0.1:4319").header("content-type","application/json").header("authorization",format!("Bearer {}",key.trim())).header("x-loom-harness","pi").header("x-loom-session-id","pi_fixture").body(Body::from(json!({"model":"test/coder","messages":[{"role":"user","content":"hello"}],"stream":true}).to_string())).unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let id = response.headers()["x-loom-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(&bytes[..], wire.as_bytes());
+        let saved = store.request(&id).unwrap();
+        assert_eq!(saved["status"], "success");
+        assert_eq!(saved["session"], "pi:pi_fixture");
+        assert_eq!(saved["provider"], "local-test");
+        assert_eq!(saved["usage"]["input"], 100);
+        assert_eq!(saved["usage"]["cache_read"], 80);
+        assert!(saved["ttft_ms"].is_number());
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("UPSTREAM_FIXTURE")
+        );
+        server.abort();
     }
 }

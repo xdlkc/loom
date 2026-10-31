@@ -144,7 +144,7 @@ async fn running_gateway_and_startup_client_sync_share_the_bundled_catalog() {
     drop(listener);
     let mut server = Server(
         command(Path::new(env!("CARGO_BIN_EXE_loom")), h, &d)
-            .args(["serve", "--port", &port.to_string()])
+            .args(["serve", "--port", &port.to_string(), "--admin-port", "0"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
