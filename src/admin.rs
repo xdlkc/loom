@@ -77,11 +77,12 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     let hosts = [
         format!("127.0.0.1:{}", app.port),
         format!("localhost:{}", app.port),
+        format!("loom.localhost:{}", app.port),
     ];
     if !host.as_ref().is_some_and(|h| hosts.contains(h))
         || origin
             .as_ref()
-            .is_some_and(|s| !hosts.iter().any(|h| s == &format!("http://{h}")))
+            .is_some_and(|s| host.as_ref().is_none_or(|h| s != &format!("http://{h}")))
         || text(&h, "sec-fetch-site").as_deref() == Some("cross-site")
     {
         return error(403, "LOCAL_SAME_ORIGIN_REQUIRED");
@@ -239,7 +240,10 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     }
     result
 }
-pub async fn open_console(data: &std::path::Path, port: u16) -> Result<()> {
+pub async fn open_console(data: &std::path::Path, port: u16, host: &str) -> Result<()> {
+    if !["loom.localhost", "localhost", "127.0.0.1"].contains(&host) {
+        return Err("管控台仅支持本机域名".into());
+    }
     let key = std::fs::read_to_string(data.join("hub.key"))?;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -254,7 +258,7 @@ pub async fn open_console(data: &std::path::Path, port: u16) -> Result<()> {
         .json()
         .await?;
     let ticket = v["ticket"].as_str().ok_or("ticket missing")?;
-    let url = format!("http://127.0.0.1:{port}/#ticket={ticket}");
+    let url = format!("http://{host}:{port}/#ticket={ticket}");
     let command = if cfg!(target_os = "macos") {
         "/usr/bin/open"
     } else {
@@ -267,7 +271,7 @@ pub async fn open_console(data: &std::path::Path, port: u16) -> Result<()> {
     {
         return Err("无法打开本机浏览器".into());
     }
-    println!("已打开 Loom 本机管控台：http://127.0.0.1:{port}/；登录票据不输出。");
+    println!("已打开 Loom 本机管控台：http://{host}:{port}/；登录票据不输出。");
     Ok(())
 }
 
@@ -386,5 +390,62 @@ mod tests {
         bad.headers_mut()
             .insert("host", "attacker.invalid:4320".parse().unwrap());
         assert_eq!(app.oneshot(bad).await.unwrap().status(), 403);
+    }
+
+    #[tokio::test]
+    async fn local_domain_login_works_and_rejects_other_local_origins() {
+        let d = tempfile::tempdir().unwrap();
+        config::init(d.path()).unwrap();
+        let key = std::fs::read_to_string(d.path().join("hub.key")).unwrap();
+        let store = Store::open(d.path()).unwrap();
+        let app = router(App::new(d.path().into(), store, 4320));
+        let authorization = format!("Bearer {}", key.trim());
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/launch",
+                None,
+                Some(&authorization),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        let mut login = request(
+            "POST",
+            "/api/login",
+            Some("http://loom.localhost:4320"),
+            None,
+            json!({"ticket":v["ticket"]}),
+        );
+        login
+            .headers_mut()
+            .insert("host", "loom.localhost:4320".parse().unwrap());
+        let response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let cookie = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        for (host, origin, expected) in [
+            ("loom.localhost:4320", "http://loom.localhost:4320", 200),
+            ("loom.localhost:4320", "http://localhost:4320", 403),
+            ("loom.localhost:4320", "http://127.0.0.1:4320", 403),
+            ("loom.localhost:4320", "http://loom.localhost:4321", 403),
+            ("other.localhost:4320", "http://other.localhost:4320", 403),
+        ] {
+            let mut req = request("GET", "/api/overview", Some(origin), None, Value::Null);
+            req.headers_mut().insert("host", host.parse().unwrap());
+            req.headers_mut().insert("cookie", cookie.parse().unwrap());
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status().as_u16(),
+                expected
+            );
+        }
     }
 }

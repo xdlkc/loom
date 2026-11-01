@@ -41,6 +41,9 @@ enum Command {
     Console {
         #[arg(long, default_value_t = 4320)]
         port: u16,
+        /// Browser hostname; the launch request always uses the loopback IP.
+        #[arg(long, default_value = "loom.localhost", value_parser = ["loom.localhost", "localhost", "127.0.0.1"])]
+        host: String,
     },
     /// Choose providers and enter hidden API Keys; names, URLs and models are preset.
     #[command(alias = "configure")]
@@ -71,7 +74,7 @@ async fn run() -> Result<()> {
     let d = cli.data_dir.unwrap_or_else(config::data_dir);
     match cli.command {
         Command::Update => update::update(&d)?,
-        Command::Console { port } => admin::open_console(&d, port).await?,
+        Command::Console { port, host } => admin::open_console(&d, port, &host).await?,
         Command::Install { no_start } => {
             if !no_start
                 && std::io::stdin().is_terminal()
