@@ -79,11 +79,15 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         format!("localhost:{}", app.port),
         format!("loom.localhost:{}", app.port),
     ];
+    let public_navigation = method == "GET"
+        && req.uri() == "/"
+        && text(&h, "sec-fetch-mode").as_deref() == Some("navigate")
+        && text(&h, "sec-fetch-dest").as_deref() == Some("document");
     if !host.as_ref().is_some_and(|h| hosts.contains(h))
         || origin
             .as_ref()
             .is_some_and(|s| host.as_ref().is_none_or(|h| s != &format!("http://{h}")))
-        || text(&h, "sec-fetch-site").as_deref() == Some("cross-site")
+        || (text(&h, "sec-fetch-site").as_deref() == Some("cross-site") && !public_navigation)
     {
         return error(403, "LOCAL_SAME_ORIGIN_REQUIRED");
     }
@@ -442,6 +446,24 @@ mod tests {
             let mut req = request("GET", "/api/overview", Some(origin), None, Value::Null);
             req.headers_mut().insert("host", host.parse().unwrap());
             req.headers_mut().insert("cookie", cookie.parse().unwrap());
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status().as_u16(),
+                expected
+            );
+        }
+        for (path, expected) in [("/", 200), ("/api/overview", 403)] {
+            let mut req = request("GET", path, None, None, Value::Null);
+            for (key, value) in [
+                ("host", "loom.localhost:4320"),
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ] {
+                req.headers_mut().insert(
+                    axum::http::HeaderName::from_static(key),
+                    value.parse().unwrap(),
+                );
+            }
             assert_eq!(
                 app.clone().oneshot(req).await.unwrap().status().as_u16(),
                 expected
