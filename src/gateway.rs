@@ -22,6 +22,9 @@ pub struct App {
     pub permits: Arc<tokio::sync::Semaphore>,
 }
 fn err(native: bool, status: u16, code: &str) -> Response {
+    err_message(native, status, code, code)
+}
+fn err_message(native: bool, status: u16, code: &str, message: &str) -> Response {
     let kind = match status {
         401 => "authentication_error",
         403 => "permission_error",
@@ -32,12 +35,39 @@ fn err(native: bool, status: u16, code: &str) -> Response {
     (
         StatusCode::from_u16(status).unwrap(),
         Json(if native {
-            json!({"type":"error","error":{"type":kind,"message":code}})
+            json!({"type":"error","error":{"type":kind,"message":message}})
         } else {
-            json!({"error":{"type":"local_hub_error","message":code,"code":code}})
+            json!({"error":{"type":"local_hub_error","message":message,"code":code}})
         }),
     )
         .into_response()
+}
+// Never reflect upstream prose, arbitrary error types, or credential-bearing URLs.
+// Only known machine-readable billing categories select a fixed explanation.
+fn upstream_error(native: bool, status: u16, body: &Value) -> Response {
+    let code = format!("UPSTREAM_{status}");
+    if status != 402 {
+        return err(native, status, &code);
+    }
+    let categories: Vec<&str> = ["/error/type", "/error/code", "/type", "/code"]
+        .iter()
+        .filter_map(|p| body.pointer(p).and_then(Value::as_str))
+        .collect();
+    let quota = ["quote_exceeded", "quota_exceeded", "usage_limit_reached"];
+    let balance = [
+        "insufficient_credit",
+        "reject_no_credit",
+        "insufficient_balance",
+        "insufficient_balance_error",
+    ];
+    let message = if categories.iter().any(|v| quota.contains(v)) {
+        "UPSTREAM_402 [subscription_quota_exhausted]: 上游套餐额度已用尽，请在对应账号查看窗口重置时间。钱包有余额不代表套餐仍有额度。"
+    } else if categories.iter().any(|v| balance.contains(v)) {
+        "UPSTREAM_402 [insufficient_credit]: 当前 Key 对应计费账户余额不足或欠费。请核对 Key 的计费范围，钱包余额与订阅额度分别计算。"
+    } else {
+        "UPSTREAM_402 [payment_required]: 上游返回计费或额度错误，具体原因尚未确认。请在 loom console 的请求详情核对上游错误、账号和 Key 所属通道。"
+    };
+    err_message(native, status, &code, message)
 }
 fn recorded_error(trace: &mut Option<Flight>, native: bool, status: u16, code: &str) -> Response {
     if let Some(t) = trace {
@@ -327,23 +357,24 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     }
     if !response.status().is_success() {
         let s = response.status().as_u16();
-        if let Some(t) = &mut trace {
-            let mut bytes = Vec::new();
-            let read = tokio::time::timeout(Duration::from_secs(2), async {
-                while let Ok(Some(chunk)) = response.chunk().await {
-                    let count = (16384 - bytes.len()).min(chunk.len());
-                    bytes.extend_from_slice(&chunk[..count]);
-                    if bytes.len() >= 16384 {
-                        break;
-                    }
+        let mut bytes = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Ok(Some(chunk)) = response.chunk().await {
+                let count = (16384 - bytes.len()).min(chunk.len());
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.len() >= 16384 {
+                    break;
                 }
-            })
-            .await;
-            let upstream = serde_json::from_slice::<Value>(&bytes)
-                .unwrap_or_else(|_| json!({"non_json":true,"captured_bytes":bytes.len()}));
+            }
+        })
+        .await;
+        let upstream = serde_json::from_slice::<Value>(&bytes)
+            .unwrap_or_else(|_| json!({"non_json":true,"captured_bytes":bytes.len()}));
+        if let Some(t) = &mut trace {
             t.error_response(json!({"upstream_error":upstream,"client_error":format!("UPSTREAM_{s}"),"error_body_incomplete":read.is_err()||bytes.len()>=16384}));
+            t.fail(s, &format!("UPSTREAM_{s}"));
         }
-        return recorded_error(&mut trace, native, s, &format!("UPSTREAM_{s}"));
+        return upstream_error(native, s, &upstream);
     }
     let request_id = trace
         .as_ref()
@@ -394,6 +425,79 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn billing_errors_keep_protocol_status_and_never_echo_upstream_secrets() {
+        for native in [false, true] {
+            for (kind, expected) in [
+                ("quote_exceeded", "subscription_quota_exhausted"),
+                ("reject_no_credit", "insufficient_credit"),
+                ("fixture-private-type", "payment_required"),
+            ] {
+                let response = upstream_error(
+                    native,
+                    402,
+                    &json!({"error":{"type":kind,"message":"Bearer sk-fixture-private-secret https://private.example/?api_key=fixture-private-secret"}}),
+                );
+                assert_eq!(response.status(), 402);
+                let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(!text.contains("fixture-private") && !text.contains("private.example"));
+                let v: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(v["error"]["message"].as_str().unwrap().contains(expected));
+                assert!(
+                    v["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("UPSTREAM_402")
+                );
+                if native {
+                    assert_eq!(v["type"], "error");
+                } else {
+                    assert_eq!(v["error"]["code"], "UPSTREAM_402");
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn billing_cause_is_available_without_body_capture_or_telemetry() {
+        let d = tempfile::tempdir().unwrap();
+        config::init(d.path()).unwrap();
+        let keyfile = d.path().join("upstream.key");
+        config::write(&keyfile, b"UPSTREAM_FIXTURE").unwrap();
+        config::write(&d.path().join("providers.json"), &serde_json::to_vec(&json!({"proxy":"","providers":{"test":{"enabled":true,"prefix":"test","name":"Test","baseURL":"https://example.invalid/v1","anthropicBaseURL":"https://example.invalid","keyFile":keyfile,"models":[{"id":"coder","maxTokens":64}]}}})).unwrap()).unwrap();
+        let upstream = Router::new().fallback(post(|| async {
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({"error":{"type":"quote_exceeded","message":"UPSTREAM_FIXTURE"}})),
+            )
+        }));
+        let bind = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = bind.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(bind, upstream).await.unwrap() });
+        let app = router(App {
+            telemetry: None,
+            upstream_override: Some(format!("http://{addr}/")),
+            dir: d.path().into(),
+            port: 4319,
+            permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        });
+        let token = std::fs::read_to_string(d.path().join("hub.key")).unwrap();
+        for uri in ["/v1/chat/completions", "/v1/messages"] {
+            let req = Request::builder().method("POST").uri(uri).header("host","localhost:4319").header("content-type","application/json").header("authorization",format!("Bearer {}",token.trim())).body(Body::from(json!({"model":"test/coder","max_tokens":32,"messages":[{"role":"user","content":"fixture"}]}).to_string())).unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), 402);
+            let text = String::from_utf8(
+                to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(text.contains("subscription_quota_exhausted"));
+            assert!(!text.contains("UPSTREAM_FIXTURE") && !text.contains(token.trim()));
+        }
+        task.abort();
+    }
     #[test]
     fn conflicting_keys_fail() {
         let mut h = HeaderMap::new();

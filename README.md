@@ -157,6 +157,16 @@ git pull --ff-only
 
 ## 本机可观测与会话管控（0.7.0）
 
+### 排查上游 402（0.7.1）
+
+`UPSTREAM_402` 表示模型供应商返回了 HTTP 402；`loom add` 只保存配置，不会迁移其他机器的账户权益或验证套餐余量。运行 `loom console`，在“请求”选择对应模型最近的失败记录，展开“上游 → 客户端”查看本机脱敏后的 `upstream_error`。不要复制 Key、完整请求或原始日志到聊天。
+
+0.7.1 起，pi / Claude Code 收到的错误说明会区分已识别的 `subscription_quota_exhausted`（额度耗尽）、`insufficient_credit`（余额不足 / 欠费）与原因尚未确认的 `payment_required`。保留 HTTP 402 和 `UPSTREAM_402` 机器码；仅将白名单错误类型转换为固定提示，不回显供应商任意错误文本。未知原因继续显示未知，不自动重试或切到其他付费通道。`loom update` 会安装修复并保留现有 Key；它不会恢复供应商额度。
+
+ZenMux 的 `quote_exceeded`、`insufficient_credit` 和 `reject_no_credit` 的区别见[官方错误文档](https://zenmux.ai/docs/guide/advanced/error-codes.html)。Kimi 预设使用国内 Kimi Code 的 `https://api.kimi.com/coding/v1`，需要 Kimi Code 控制台签发的 Key；Moonshot 开放平台 Key 与会员订阅不共用，详见[官方接入说明](https://www.kimi.com/code/docs/en/)。
+
+### 打开管控台
+
 ```sh
 loom update                 # 更新并重启；已有配置与密钥保留
 loom console                # 安全打开本机管控台，不输出入口 Key 或登录票据
