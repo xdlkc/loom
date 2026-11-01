@@ -88,7 +88,7 @@ SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段�
 }
 ```
 
-`proxy` 留空直连；需要代理时在本机配置 URL。不要把 Key 放进 URL。供应商向导只使用公共预设，不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
+`proxy` 留空直连；需要代理时在本机配置 URL。0.7.2 起可用 `loom proxy` 查看当前模式、`loom proxy http://127.0.0.1:7890` 设置持久代理（7890 需换成自己代理软件的实际 HTTP / Mixed 端口）、`loom proxy off` 恢复直连。下一次请求即生效，无需重启，保留全部 provider、Key 和客户端配置。命令拒绝携带用户名、密码、查询参数和自定义路径的代理 URL；不打印完整代理地址。Loom 明确不读取终端 `HTTP_PROXY` / `HTTPS_PROXY`，自启动服务也不依赖当前终端的环境。不要把 Key 放进 URL。供应商向导只使用公共预设，不携带任何账号的预填 Key、真实套餐、消费记录或模型权限保证。Management Key 不能用于模型推理。
 
 `loom set-key local-demo` 隐藏输入轮换 Key。`loom check` 检查配置及 Key 文件是否存在，不验证推理权限。`sync` 保留无关客户端配置、OAuth 和权限模式，修改前私密备份；不强制改变既有默认模型或接管其他 provider。
 
@@ -164,6 +164,12 @@ git pull --ff-only
 0.7.1 起，pi / Claude Code 收到的错误说明会区分已识别的 `subscription_quota_exhausted`（额度耗尽）、`insufficient_credit`（余额不足 / 欠费）与原因尚未确认的 `payment_required`。保留 HTTP 402 和 `UPSTREAM_402` 机器码；仅将白名单错误类型转换为固定提示，不回显供应商任意错误文本。未知原因继续显示未知，不自动重试或切到其他付费通道。`loom update` 会安装修复并保留现有 Key；它不会恢复供应商额度。
 
 ZenMux 的 `quote_exceeded`、`insufficient_credit` 和 `reject_no_credit` 的区别见[官方错误文档](https://zenmux.ai/docs/guide/advanced/error-codes.html)。Kimi 预设使用国内 Kimi Code 的 `https://api.kimi.com/coding/v1`，需要 Kimi Code 控制台签发的 Key；Moonshot 开放平台 Key 与会员订阅不共用，详见[官方接入说明](https://www.kimi.com/code/docs/en/)。
+
+### 排查上游连接失败（0.7.2）
+
+HTTP 502 `UPSTREAM_UNAVAILABLE` 表示发送请求时未取得有效上游响应，不能据此判断余额、Key 或供应商整体故障。0.7.2 保留状态码和机器码，并在消息中提供固定的 `connect_failed` / `dns_error` / `tls_error` / `timeout` / `request_invalid` / `transport_failed` 类别，记录到本机请求详情中；不显示底层错误原文、URL 或凭据。分类属于诊断提示，未知原因保持未知。TLS 问题应检查时间、证书链和代理，不关闭证书验证。
+
+在报错机器用 `curl --noproxy '*' --connect-timeout 8 --max-time 12 -sS -o /dev/null -w 'HTTP %{http_code}\n' https://zenmux.ai/api/v1/models` 无 Key 检查直连，再去掉 `--noproxy '*'` 比较当前终端网络。401 / 403 等 HTTP 响应仅说明这次 curl 连通，不证明 Key、套餐和 Loom 的 TLS 环境正常；HTTP 000、DNS 或 TLS 错误则先排查网络。若只有代理路径可达，设置 `loom proxy` 为本机实际 HTTP / Mixed 代理端口后再试。代理设置不触发自动重试或跨供应商付费回退。
 
 ### 打开管控台
 

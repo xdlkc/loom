@@ -4,6 +4,7 @@ mod config;
 mod gateway;
 mod harness;
 mod install;
+mod network;
 mod onboarding;
 mod telemetry;
 mod update;
@@ -61,6 +62,10 @@ enum Command {
     Sync,
     Status,
     Check,
+    /// Show proxy mode; set an HTTP/HTTPS proxy URL, or use 'off' for direct access.
+    Proxy {
+        url: Option<String>,
+    },
 }
 #[tokio::main]
 async fn main() {
@@ -73,6 +78,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let d = cli.data_dir.unwrap_or_else(config::data_dir);
     match cli.command {
+        Command::Proxy { url } => network::proxy(&d, url.as_deref())?,
         Command::Update => update::update(&d)?,
         Command::Console { port, host } => admin::open_console(&d, port, &host).await?,
         Command::Install { no_start } => {

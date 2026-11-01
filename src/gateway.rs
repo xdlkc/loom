@@ -75,6 +75,27 @@ fn recorded_error(trace: &mut Option<Flight>, native: bool, status: u16, code: &
     }
     err(native, status, code)
 }
+fn transport_error(
+    trace: &mut Option<Flight>,
+    native: bool,
+    status: u16,
+    e: &reqwest::Error,
+    proxy_configured: bool,
+) -> Response {
+    let (category, hint) = crate::network::failure(e);
+    if let Some(t) = trace {
+        t.error_response(
+            json!({"transport_error":{"category":category,"proxy_configured":proxy_configured}}),
+        );
+        t.fail(status, "UPSTREAM_UNAVAILABLE");
+    }
+    err_message(
+        native,
+        status,
+        "UPSTREAM_UNAVAILABLE",
+        &format!("UPSTREAM_UNAVAILABLE [{category}]: {hint}"),
+    )
+}
 fn header<'a>(h: &'a HeaderMap, k: &str) -> Option<&'a str> {
     h.get(k).and_then(|v| v.to_str().ok())
 }
@@ -304,6 +325,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(600));
+    let proxy_configured = registry["proxy"].as_str().is_some_and(|v| !v.is_empty());
     if let Some(proxy) = registry["proxy"].as_str().filter(|v| !v.is_empty()) {
         builder = match reqwest::Proxy::all(proxy) {
             Ok(p) => builder.proxy(p),
@@ -312,7 +334,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     }
     let client = match builder.build() {
         Ok(v) => v,
-        Err(_) => return recorded_error(&mut trace, native, 503, "UPSTREAM_UNAVAILABLE"),
+        Err(e) => return transport_error(&mut trace, native, 503, &e, proxy_configured),
     };
     let streaming = body["stream"] == true;
     let mut request = client.post(url).json(&body).header(
@@ -350,7 +372,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     }
     let mut response = match request.send().await {
         Ok(v) => v,
-        Err(_) => return recorded_error(&mut trace, native, 502, "UPSTREAM_UNAVAILABLE"),
+        Err(e) => return transport_error(&mut trace, native, 502, &e, proxy_configured),
     };
     if let Some(t) = &mut trace {
         t.headers(response.status().as_u16());
@@ -425,6 +447,50 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn transport_failure_keeps_502_protocol_and_only_records_safe_categories() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let e = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/?key=PRIVATE_TRANSPORT_FIXTURE"))
+            .send()
+            .await
+            .unwrap_err();
+        let d = tempfile::tempdir().unwrap();
+        config::init(d.path()).unwrap();
+        let store = Store::open(d.path()).unwrap();
+        for native in [false, true] {
+            let mut trace = Some(Flight::start(
+                store.clone(),
+                d.path(),
+                &HeaderMap::new(),
+                if native { "anthropic" } else { "openai" },
+            ));
+            let id = trace.as_ref().unwrap().record.id.clone();
+            let response = transport_error(&mut trace, native, 502, &e, true);
+            assert_eq!(response.status(), 502);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("connect_failed") && text.contains("UPSTREAM_UNAVAILABLE"));
+            assert!(
+                !text.contains("PRIVATE_TRANSPORT_FIXTURE") && !text.contains(&address.to_string())
+            );
+            let detail = store.request(&id).unwrap();
+            assert_eq!(
+                detail["response"]["transport_error"]["category"],
+                "connect_failed"
+            );
+            assert_eq!(
+                detail["response"]["transport_error"]["proxy_configured"],
+                true
+            );
+            assert!(!detail.to_string().contains("PRIVATE_TRANSPORT_FIXTURE"));
+        }
+    }
     #[tokio::test]
     async fn billing_errors_keep_protocol_status_and_never_echo_upstream_secrets() {
         for native in [false, true] {
