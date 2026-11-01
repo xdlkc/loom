@@ -18,3 +18,7 @@ __pycache__/
 *.db
 *.db-*
 *.jsonl
+
+# Frontend prototype dependencies and generated output
+node_modules/
+dist/

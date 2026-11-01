@@ -92,6 +92,18 @@ SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段�
 
 `loom set-key local-demo` 隐藏输入轮换 Key。`loom check` 检查配置及 Key 文件是否存在，不验证推理权限。`sync` 保留无关客户端配置、OAuth 和权限模式，修改前私密备份；不强制改变既有默认模型或接管其他 provider。
 
+0.7.3 修复通过本机入口访问 DeepSeek 时的客户端思考控制：`loom sync` 根据实际上游 `api.deepseek.com` 为 pi 写入 `compat.thinkingFormat: "deepseek"`，关闭时明确发送 `thinking.type: "disabled"`，开启时发送 `enabled` 及思考强度。按[官方映射](https://api-docs.deepseek.com/guides/thinking_mode/)将 minimal 映射到 low、medium / xhigh 映射到 high，max 保留 max。自定义 `piCompat` 和模型级 `compat` / `thinkingLevelMap` 继续生效，模型级设置优先。不会修改用户的默认档位或按模型保存的偏好。旧 pi 若不识别这些字段，需要先升级 pi。
+
+OpenCode V2 同时获得 `capabilities.reasoning` 对象（不是布尔值）；DeepSeek 提供 none / low / high / max 档位，并声明 `reasoning_content` 的读取与回传。其他模型只同步其已有能力声明，不推断未核实的控制档位。更新后重开 pi / opencode2；现有 pi 会话可能保留自己的档位，可用 `/thinking` 调整。DeepSeek 未收到开关时会按上游默认开启思考，因此界面 off 必须显式发送关闭参数；网关本身仍不转换这些参数。
+
+已在 OpenCode 2.1.4 的本机模型 API 核实四个档位及其请求体。该版本仍未在运行时 `capabilities` 中暴露 reasoning 属性，故不能用“是否显示推理徽标”判断开关是否生效；Loom 的配置声明不会修复客户端自身的徽标显示缺陷。
+
+可选的真实 pi SDK 出站回归测试（只访问本机模拟接口，不读取真实 Key）：
+
+```sh
+node tests/pi-thinking.mjs target/debug/loom /path/to/@earendil-works/pi-ai
+```
+
 ## 多台机器的模型目录
 
 从 0.6.0 起，[catalog/zenmux.json](catalog/zenmux.json) 随 Loom 一起发布公共模型目录。已有 ZenMux provider（`https://zenmux.ai/api/v1`）在运行时自动补充这些模型；没有配置 ZenMux 的机器不会自动创建 provider。私有 `providers.json` 和 Key 文件仍留在各台机器，不进入仓库，也不会因为更新公共目录而被改写。
@@ -186,6 +198,8 @@ loom console                # 安全打开本机管控台，不输出入口 Key 
 - **采集设置**：分别控制请求 / 响应正文和原生会话导入，保留期默认为 30 天（1–3650 天），后台每 15 秒检查原生轨迹并清理到期副本。清理不修改 harness 原始文件。关闭正文采集只影响之后的请求，已有副本按保留期清理。
 
 `loom sync` / 网关启动会部署仅用于关联的本机 pi 扩展和 opencode2 V2 插件，并保留原有插件、OAuth、默认模型及权限设置。pi 使用官方 `before_provider_headers`；OpenCode V2 使用 `ctx.session.hook("http.request")`；只向本机 hub 请求附加 session 标识，网关不再转发这些标识。Claude Code 从原生请求 metadata / transcript 响应 ID 精确关联。导入默认路径为 `~/.pi/agent/sessions`、`~/.claude/projects`、`~/.local/share/opencode/opencode.db`（或 `opencode2`）；当前用户自定义的其他存储根目录不自动扫描。
+
+会话工作台的独立交互原型保存在 [`prototypes/session-workspace`](prototypes/session-workspace)。会话列表、对话回放、时间轴和步骤详情共享选择状态；使用合成演示数据，不接入真实会话或密钥，不替换当前生产控制台。
 
 观测数据位于原私有数据目录下 `observability/traces.sqlite3`（文件 0600、目录 0700）。完整轨迹可能包含代码、提示词与工具输出；只保存在本机，先移除已知入口 / 上游凭据、认证字段及常见 token 模式，不上传仓库或厂商。程序输出只记录安全状态。正文的观测副本上限为每响应 16 MiB；超过上限显式标注截断，不影响原始推理字节透传。会话和请求不会凭提示词相似度猜测关联。
 

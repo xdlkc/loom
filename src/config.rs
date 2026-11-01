@@ -188,6 +188,54 @@ pub fn catalog(r: &Value) -> Result<Vec<Model>> {
 fn quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
+// Clients only see loopback, so their URL-based vendor detection cannot work.
+// Use the actual upstream host, never a user-chosen route prefix or model name.
+fn direct_deepseek(m: &Model) -> bool {
+    m.m["reasoning"] == true
+        && m.p["baseURL"]
+            .as_str()
+            .and_then(|s| reqwest::Url::parse(s).ok())
+            .is_some_and(|u| u.host_str() == Some("api.deepseek.com"))
+}
+fn pi_model(m: &Model, label: String) -> Value {
+    let mut v = m.m.clone();
+    v["id"] = json!(m.id);
+    v["name"] = json!(label);
+    let mut compat = json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":false,"maxTokensField":"max_tokens","requiresReasoningContentOnAssistantMessages":true});
+    if direct_deepseek(m) {
+        compat["thinkingFormat"] = json!("deepseek");
+        compat["supportsReasoningEffort"] = json!(true);
+        // Match DeepSeek's documented effort mapping without changing user defaults.
+        let mut levels = json!({"minimal":"low","low":"low","medium":"high","high":"high","xhigh":"high","max":"max"});
+        if let Some(custom) = m.m["thinkingLevelMap"].as_object() {
+            levels.as_object_mut().unwrap().extend(custom.clone());
+        }
+        v["thinkingLevelMap"] = levels;
+    }
+    for overrides in [&m.p["piCompat"], &m.m["compat"]] {
+        if let Some(extra) = overrides.as_object() {
+            compat.as_object_mut().unwrap().extend(extra.clone());
+        }
+    }
+    v["compat"] = compat;
+    v
+}
+fn opencode_model(m: &Model, label: String) -> Value {
+    let mut v = json!({"name":label,"capabilities":{"tools":true,"reasoning":{"supported":m.m["reasoning"] == true},"input":m.m.get("input").cloned().unwrap_or(json!(["text"])),"output":["text"]},"limit":{"context":m.m["contextWindow"].as_u64().unwrap_or(128000),"output":m.m["maxTokens"].as_u64().unwrap_or(8192)}});
+    if direct_deepseek(m) {
+        v["capabilities"]["reasoning"] =
+            json!({"supported":true,"toggle":true,"effort":["low","high","max"]});
+        v["compatibility"] = json!({"reasoningField":"reasoning_content","requireReasoning":true});
+        // The shared OpenAI-compatible package cannot infer DeepSeek's toggle.
+        // Explicit body overlays also avoid sending an effort alongside disabled.
+        let mut variants = vec![json!({"id":"none","body":{"thinking":{"type":"disabled"}}})];
+        for effort in ["low", "high", "max"] {
+            variants.push(json!({"id":effort,"body":{"thinking":{"type":"enabled"},"reasoning_effort":effort}}));
+        }
+        v["variants"] = json!(variants);
+    }
+    v
+}
 pub fn sync(d: &Path, h: &Path) -> Result<()> {
     sync_for_port(d, h, 4319)
 }
@@ -225,8 +273,11 @@ pub fn sync_for_port(d: &Path, h: &Path, port: u16) -> Result<()> {
             .replace('-', " ");
         format!("hub/{name} · {}", m.id.split('/').next().unwrap())
     };
-    pi["providers"]["hub"] = json!({"name":"hub","baseUrl":format!("http://127.0.0.1:{port}/v1"),"api":"openai-completions","apiKey":format!("!cat {}",quote(&key)),"authHeader":true,"models":models.iter().map(|m|{let mut v=m.m.clone();v["id"]=json!(m.id);v["name"]=json!(label(m));v["compat"]=json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":false,"maxTokensField":"max_tokens","requiresReasoningContentOnAssistantMessages":true});if let Some(extra)=m.p["piCompat"].as_object(){v["compat"].as_object_mut().unwrap().extend(extra.clone());}v}).collect::<Vec<_>>()});
-    let entries:serde_json::Map<String,Value>=models.iter().map(|m|(m.id.clone(),json!({"name":label(m),"capabilities":{"tools":true,"input":m.m.get("input").cloned().unwrap_or(json!(["text"])),"output":["text"]},"limit":{"context":m.m["contextWindow"].as_u64().unwrap_or(128000),"output":m.m["maxTokens"].as_u64().unwrap_or(8192)}}))).collect();
+    pi["providers"]["hub"] = json!({"name":"hub","baseUrl":format!("http://127.0.0.1:{port}/v1"),"api":"openai-completions","apiKey":format!("!cat {}",quote(&key)),"authHeader":true,"models":models.iter().map(|m| pi_model(m,label(m))).collect::<Vec<_>>()});
+    let entries: serde_json::Map<String, Value> = models
+        .iter()
+        .map(|m| (m.id.clone(), opencode_model(m, label(m))))
+        .collect();
     oc["providers"]["hub"] = json!({"name":"hub","package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":format!("http://127.0.0.1:{port}/v1"),"apiKey":format!("{{file:{}}}",key.display())},"models":entries});
     if let Some(enabled) = settings["enabledModels"].as_array() {
         let mut list: Vec<Value> = enabled
@@ -391,5 +442,79 @@ mod tests {
         r["providers"]["local-test"]["baseURL"] = json!("https://safe.invalid");
         r["providers"]["local-test"]["models"] = json!([{"id":"x"},{"id":"x"}]);
         assert!(catalog(&r).is_err());
+    }
+    #[test]
+    fn thinking_metadata_follows_upstream_and_preserves_preferences() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("data");
+        let h = t.path().join("home");
+        init(&d).unwrap();
+        let registry = json!({"providers":{
+            "custom-route":{"prefix":"wallet","enabled":true,"baseURL":"https://api.deepseek.com/v1","keyFile":"fixture","models":[{"id":"deepseek-flash","reasoning":true},{"id":"deepseek-v4-pro","reasoning":true}]},
+            "not-deepseek":{"prefix":"deepseek","enabled":true,"baseURL":"https://other.invalid","keyFile":"fixture","models":[{"id":"deepseek-flash","reasoning":true},{"id":"plain","reasoning":false}]}
+        }});
+        save(&d.join("providers.json"), &registry).unwrap();
+        let preferences = json!({"defaultProvider":"native","defaultModel":"keep","defaultThinkingLevel":"off","modelThinkingLevels":{"hub/wallet/deepseek-flash":"high"},"theme":"dark"});
+        save(&h.join(".pi/agent/settings.json"), &preferences).unwrap();
+        sync(&d, &h).unwrap();
+        assert_eq!(read(&d.join("providers.json")).unwrap(), registry);
+        assert_eq!(
+            read(&h.join(".pi/agent/settings.json")).unwrap(),
+            preferences
+        );
+        let pi = read(&h.join(".pi/agent/models.json")).unwrap();
+        let oc = read(&h.join(".config/opencode/opencode.json")).unwrap();
+        for id in ["wallet/deepseek-flash", "wallet/deepseek-v4-pro"] {
+            let m = pi["providers"]["hub"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap();
+            assert_eq!(m["compat"]["thinkingFormat"], "deepseek");
+            assert_eq!(m["compat"]["supportsReasoningEffort"], true);
+            assert_eq!(m["thinkingLevelMap"]["medium"], "high");
+            assert_eq!(m["thinkingLevelMap"]["max"], "max");
+            let m = &oc["providers"]["hub"]["models"][id];
+            assert_eq!(m["capabilities"]["reasoning"]["supported"], true);
+            assert_eq!(m["compatibility"]["reasoningField"], "reasoning_content");
+            let off = &m["variants"][0];
+            assert_eq!(off["id"], "none");
+            assert_eq!(off["body"]["thinking"]["type"], "disabled");
+            assert!(off["body"].get("reasoning_effort").is_none());
+        }
+        let other = pi["providers"]["hub"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "deepseek/deepseek-flash")
+            .unwrap();
+        assert!(other["compat"].get("thinkingFormat").is_none());
+        assert!(
+            oc["providers"]["hub"]["models"]["deepseek/deepseek-flash"]
+                .get("variants")
+                .is_none()
+        );
+        assert_eq!(
+            oc["providers"]["hub"]["models"]["deepseek/plain"]["capabilities"]["reasoning"]["supported"],
+            false
+        );
+        let before = fs::read(h.join(".pi/agent/models.json")).unwrap();
+        sync(&d, &h).unwrap();
+        assert_eq!(fs::read(h.join(".pi/agent/models.json")).unwrap(), before);
+    }
+    #[test]
+    fn explicit_pi_compat_and_level_overrides_survive_sync() {
+        let m = Model {
+            id: "custom/deepseek-flash".into(),
+            p: json!({"baseURL":"https://api.deepseek.com","piCompat":{"supportsUsageInStreaming":false,"thinkingFormat":"zai"}}),
+            m: json!({"id":"deepseek-flash","reasoning":true,"compat":{"thinkingFormat":"deepseek","supportsReasoningEffort":false},"thinkingLevelMap":{"off":null,"medium":"max"}}),
+        };
+        let pi = pi_model(&m, "fixture".into());
+        assert_eq!(pi["compat"]["thinkingFormat"], "deepseek");
+        assert_eq!(pi["compat"]["supportsUsageInStreaming"], false);
+        assert_eq!(pi["compat"]["supportsReasoningEffort"], false);
+        assert_eq!(pi["thinkingLevelMap"]["medium"], "max");
+        assert_eq!(pi["thinkingLevelMap"]["off"], Value::Null);
     }
 }
