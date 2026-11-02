@@ -337,13 +337,14 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         Err(e) => return transport_error(&mut trace, native, 503, &e, proxy_configured),
     };
     let streaming = body["stream"] == true;
+    let native_api_key = messages && !config::anthropic_bearer(&route.p);
     let mut request = client.post(url).json(&body).header(
-        if messages {
+        if native_api_key {
             "x-api-key"
         } else {
             "authorization"
         },
-        if messages {
+        if native_api_key {
             upstream_key.trim().to_string()
         } else {
             format!("Bearer {}", upstream_key.trim())
@@ -661,6 +662,53 @@ mod tests {
         gate.notify_one();
         let tail = stream.next().await.unwrap().unwrap();
         assert!(String::from_utf8_lossy(&tail).contains("message_stop"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn longcat_uses_bearer_for_both_protocols_and_preserves_thinking() {
+        let d = tempfile::tempdir().unwrap();
+        config::init(d.path()).unwrap();
+        let keyfile = d.path().join("upstream.key");
+        config::write(&keyfile, b"LONGCAT_FIXTURE").unwrap();
+        config::save(&d.path().join("providers.json"), &json!({"providers":{"custom-name":{"prefix":"meituan","enabled":true,"baseURL":"https://api.longcat.chat/openai/v1","keyFile":keyfile,"models":[{"id":"LongCat-2.5","maxTokens":128}]}}})).unwrap();
+        let upstream = Router::new().route(
+            "/",
+            post(|h: HeaderMap, Json(v): Json<Value>| async move {
+                assert_eq!(header(&h, "authorization"), Some("Bearer LONGCAT_FIXTURE"));
+                assert!(!h.contains_key("x-api-key"));
+                assert_eq!(v["model"], "LongCat-2.5");
+                assert_eq!(v["thinking"]["type"], "disabled");
+                assert_eq!(v["thinking_budget"], 64);
+                assert_eq!(v["max_tokens"], 128);
+                assert!(v.get("reasoning_effort").is_none());
+                Json(json!({"id":"fixture","usage":{"input_tokens":1,"output_tokens":1}}))
+            }),
+        );
+        let bind = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = bind.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(bind, upstream).await.unwrap() });
+        let token = std::fs::read_to_string(d.path().join("hub.key")).unwrap();
+        for (path, auth, value) in [
+            (
+                "/v1/chat/completions",
+                "authorization",
+                format!("Bearer {}", token.trim()),
+            ),
+            ("/v1/messages", "x-api-key", token.trim().to_owned()),
+        ] {
+            let app = router(App {
+                telemetry: None,
+                upstream_override: Some(format!("http://{address}/")),
+                dir: d.path().into(),
+                port: 4319,
+                permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            });
+            let req = axum::http::Request::builder().method("POST").uri(path).header("host","localhost:4319").header("content-type","application/json").header(auth,value).body(Body::from(json!({"model":"meituan/LongCat-2.5","max_tokens":256,"messages":[{"role":"user","content":"fixture"}],"thinking":{"type":"disabled"},"thinking_budget":64}).to_string())).unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            assert_eq!(response.status(), 200);
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("LONGCAT_FIXTURE"));
+        }
         task.abort();
     }
     #[tokio::test]

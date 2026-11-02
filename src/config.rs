@@ -113,6 +113,7 @@ pub fn anthropic(p: &Value) -> Result<Option<String>> {
             "https://api.minimax.cn/v1" => Some("https://api.minimax.cn/anthropic"),
             "https://api.minimaxi.com/v1" => Some("https://api.minimaxi.com/anthropic"),
             "https://api.minimax.io/v1" => Some("https://api.minimax.io/anthropic"),
+            "https://api.longcat.chat/openai/v1" => Some("https://api.longcat.chat/anthropic"),
             _ => None,
         });
     native
@@ -128,6 +129,15 @@ pub fn anthropic(p: &Value) -> Result<Option<String>> {
             ))
         })
         .transpose()
+}
+// LongCat's Anthropic-compatible endpoint explicitly requires Bearer authentication.
+// Determine this from the resolved upstream URL, not a user-selected provider prefix.
+pub fn anthropic_bearer(p: &Value) -> bool {
+    anthropic(p)
+        .ok()
+        .flatten()
+        .and_then(|s| reqwest::Url::parse(&s).ok())
+        .is_some_and(|u| u.host_str() == Some("api.longcat.chat"))
 }
 #[derive(Clone, Debug)]
 pub struct Model {

@@ -74,6 +74,14 @@ const PRESETS: &[Preset] = &[
             ("k3.1-pro-highspeed", "K3.1 Pro Highspeed"),
         ],
     },
+    Preset {
+        id: "longcat",
+        name: "LongCat · 美团",
+        base: "https://api.longcat.chat/openai/v1",
+        billing: "LongCat API 钱包 / Token 资源包",
+        key_hint: "LongCat 开放平台 API Key（不是网页登录令牌）",
+        models: &[("LongCat-2.5", "LongCat 2.5")],
+    },
 ];
 
 trait Input {
@@ -133,8 +141,13 @@ fn models(ids: &[(&str, &str)], reasoning: bool) -> Value {
     )
 }
 fn preset_provider(p: &Preset, key: &Path) -> Value {
-    json!({"prefix":p.id,"name":p.name,"baseURL":p.base,"billing":p.billing,
-        "enabled":true,"keyFile":key,"models":models(p.models, true)})
+    let mut value = json!({"prefix":p.id,"name":p.name,"baseURL":p.base,"billing":p.billing,
+        "enabled":true,"keyFile":key,"models":models(p.models, true)});
+    if p.id == "longcat" {
+        // LongCat uses the same enabled/disabled thinking object, not DeepSeek's effort levels.
+        value["piCompat"] = json!({"thinkingFormat":"deepseek","supportsReasoningEffort":false});
+    }
+    value
 }
 pub fn needs_setup(d: &Path) -> Result<bool> {
     if !d.join("providers.json").exists() {
@@ -151,7 +164,7 @@ pub fn configure(d: &Path, requested: &[String], custom: bool) -> Result<()> {
         None
     } else {
         let chosen = selection(&requested.join(",")).map_err(|_| {
-            eprintln!("供应商可选：zenmux / glm / minimax / deepseek / kimi；其他供应商用 loom add --custom。");
+            eprintln!("供应商可选：zenmux / glm / minimax / deepseek / kimi / longcat；其他供应商用 loom add --custom。");
             "unknown provider"
         })?;
         Some(chosen)
@@ -188,9 +201,10 @@ fn wizard(
                     let answer = io.line("回车全部 / 编号多选如 1,4 / 0 退出")?;
                     match selection(&answer) {
                         Ok(s) => break s,
-                        Err(_) => {
-                            io.say("请输入 1–5 的编号（逗号分隔）或供应商名称；回车选择全部。")
-                        }
+                        Err(_) => io.say(&format!(
+                            "请输入 1–{} 的编号（逗号分隔）或供应商名称；回车选择全部。",
+                            PRESETS.len()
+                        )),
                     }
                 }
             }
@@ -373,11 +387,15 @@ mod tests {
     }
     #[test]
     fn selects_all_by_default_and_supports_names_numbers_and_deduplication() {
-        assert_eq!(selection("").unwrap(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            selection("").unwrap(),
+            (0..PRESETS.len()).collect::<Vec<_>>()
+        );
         assert_eq!(selection("1,4,1").unwrap(), vec![0, 3]);
         assert_eq!(selection("kimi，DeepSeek").unwrap(), vec![4, 3]);
         assert!(selection("0").unwrap().is_empty());
-        for bad in ["6", "1,unknown", "0,1", ","] {
+        assert_eq!(selection("LongCat").unwrap(), vec![5]);
+        for bad in ["7", "1,unknown", "0,1", ","] {
             assert!(selection(bad).is_err());
         }
     }
@@ -391,7 +409,10 @@ mod tests {
             &json!({"permissions":{"defaultMode":"manual"}}),
         )
         .unwrap();
-        let mut io = Script::new(&[""], &["ZENMUX_FIXTURE", "", "", "DEEPSEEK_FIXTURE", ""]);
+        let mut io = Script::new(
+            &[""],
+            &["ZENMUX_FIXTURE", "", "", "DEEPSEEK_FIXTURE", "", ""],
+        );
         wizard(&d, &h, None, false, &mut io).unwrap();
         assert!(io.lines.is_empty() && io.keys.is_empty());
         let r = config::read(&d.join("providers.json")).unwrap();
@@ -437,25 +458,40 @@ mod tests {
                 "FIXTURE_C",
                 "FIXTURE_D",
                 "FIXTURE_E",
+                "FIXTURE_F",
             ],
         );
         wizard(
             t.path(),
             &t.path().join("home"),
-            Some((0..5).collect()),
+            Some((0..PRESETS.len()).collect()),
             false,
             &mut io,
         )
         .unwrap();
         let r = config::read(&t.path().join("providers.json")).unwrap();
         let catalog = config::catalog(&r).unwrap();
-        assert_eq!(catalog.len(), 15);
+        assert_eq!(catalog.len(), 16);
         for m in catalog {
             assert!(config::anthropic(&m.p).unwrap().is_some());
         }
         assert_eq!(
             r["providers"]["local-glm"]["baseURL"],
             "https://open.bigmodel.cn/api/coding/paas/v4"
+        );
+        assert_eq!(
+            r["providers"]["local-longcat"]["models"][0]["id"],
+            "LongCat-2.5"
+        );
+        assert_eq!(
+            config::anthropic(&r["providers"]["local-longcat"])
+                .unwrap()
+                .unwrap(),
+            "https://api.longcat.chat/anthropic/v1/messages"
+        );
+        assert_eq!(
+            r["providers"]["local-longcat"]["piCompat"]["supportsReasoningEffort"],
+            false
         );
         #[cfg(unix)]
         {
@@ -500,7 +536,7 @@ mod tests {
     fn no_key_means_no_provider_or_client_configuration() {
         let t = tempfile::tempdir().unwrap();
         let h = t.path().join("home");
-        let mut io = Script::new(&[""], &["", "", "", "", ""]);
+        let mut io = Script::new(&[""], &["", "", "", "", "", ""]);
         wizard(t.path(), &h, None, false, &mut io).unwrap();
         assert!(needs_setup(t.path()).unwrap());
         assert!(!h.exists());
@@ -509,7 +545,7 @@ mod tests {
     #[test]
     fn invalid_input_retries_without_saving_or_printing_it() {
         let t = tempfile::tempdir().unwrap();
-        let mut io = Script::new(&["6", "4"], &["BAD FIXTURE", "VALID_FIXTURE"]);
+        let mut io = Script::new(&["7", "4"], &["BAD FIXTURE", "VALID_FIXTURE"]);
         wizard(t.path(), &t.path().join("home"), None, false, &mut io).unwrap();
         assert_eq!(
             std::fs::read(t.path().join("keys/local-deepseek.key")).unwrap(),

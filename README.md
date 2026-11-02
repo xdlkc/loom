@@ -21,6 +21,7 @@ loom status
 loom add                       # 默认全部；也可输入 1,4 等编号多选
 loom add zenmux deepseek        # 只询问这两家的 Key
 loom add kimi                  # 已配置时，输入新 Key 更换；回车保留
+loom add longcat               # 美团 LongCat；只需隐藏输入开放平台 Key
 ```
 
 `loom configure` 是 `loom add` 的别名。不用填写名称、地址、模型 ID；输入的 Key 不显示、不放进命令参数，不接受管道传入。每家保存后立即落盘，未填 Key 的新供应商不会创建；已存在的供应商只轮换 Key，保留模型、地址、名称、启用状态及其他设置。旧 Key 仅在本机私密备份。重新运行向导可以继续未完成的配置。
@@ -32,8 +33,9 @@ loom add kimi                  # 已配置时，输入新 Key 更换；回车保
 | 3 | MiniMax 国内订阅 | Subscription Key | MiniMax M3.1 Flash |
 | 4 | DeepSeek API 钱包 | 开放平台 API Key | DeepSeek Flash / V4 Pro |
 | 5 | Kimi Code 国内订阅 | Kimi Code API Key，非 Moonshot Key | K3.1 Pro / Highspeed |
+| 6 | LongCat 美团开放平台 | LongCat API Key，非网页登录令牌 | LongCat-2.5 |
 
-预设是公共接入信息，不代表账号已获所有模型权限；模型权限仍由上游套餐决定，不自动发送付费测试请求。上下文 128K、最大输出 8K、文本输入是保守初始设置，可在中央配置中调整。不同套餐不混用、不跨供应商回退。预设来源：[ZenMux](https://zenmux.ai/docs/guide/quickstart.html)、[GLM Coding Plan](https://docs.bigmodel.cn/cn/coding-plan/quick-start)、[MiniMax](https://platform.minimax.cn/docs/m-plan/quickstart)、[DeepSeek](https://api-docs.deepseek.com/quick_start/pricing-details-cny/)、[Kimi Code](https://www.kimi.com/code/docs/)。
+预设是公共接入信息，不代表账号已获所有模型权限；模型权限仍由上游套餐决定，不自动发送付费测试请求。上下文 128K、最大输出 8K、文本输入是保守初始设置，可在中央配置中调整。不同套餐不混用、不跨供应商回退。预设来源：[ZenMux](https://zenmux.ai/docs/guide/quickstart.html)、[GLM Coding Plan](https://docs.bigmodel.cn/cn/coding-plan/quick-start)、[MiniMax](https://platform.minimax.cn/docs/m-plan/quickstart)、[DeepSeek](https://api-docs.deepseek.com/quick_start/pricing-details-cny/)、[Kimi Code](https://www.kimi.com/code/docs/)、[LongCat](https://longcat.chat/platform/docs/zh/)。
 
 其他供应商、海外站点或 API 钱包独立接入仍可手动配置：
 
@@ -64,7 +66,9 @@ cargo build --release --locked
 
 SSE 增量透传；思考、工具调用、图片、缓存参数和厂商字段原样透传，不转换思考强度。`max_tokens` 受中央模型输出上限约束。上游不支持的参数可能报错。仅支持上述推理接口，不声明支持整个 Anthropic 平台或自动审批服务。
 
-原生 Anthropic 路由已映射 ZenMux、GLM Coding Plan、MiniMax、DeepSeek、Kimi Code；自定义 provider 可配置 `anthropicBaseURL`。只接受 HTTPS 上游、不跟随重定向；请求正文可按采集设置保存于本机私有数据库；Key 与认证头不进入观测数据，也不写程序输出。每次请求重新读取配置；本机配置变化时自动更新客户端目录。运行中的客户端可能需重启或刷新列表。
+原生 Anthropic 路由已映射 ZenMux、GLM Coding Plan、MiniMax、DeepSeek、Kimi Code、LongCat；自定义 provider 可配置 `anthropicBaseURL`。只接受 HTTPS 上游、不跟随重定向；请求正文可按采集设置保存于本机私有数据库；Key 与认证头不进入观测数据，也不写程序输出。每次请求重新读取配置；本机配置变化时自动更新客户端目录。运行中的客户端可能需重启或刷新列表。
+
+LongCat 的 OpenAI 地址为 `https://api.longcat.chat/openai/v1`，Anthropic 地址为 `https://api.longcat.chat/anthropic`，两条上游路由均使用 Bearer 认证。pi 通过预设兼容项显式发送 `thinking.type: enabled / disabled`，不发送未声明支持的 `reasoning_effort`；`thinking_budget` 等原始字段继续透传。该 Key 用于模型调用，额度工具不会把模型列表查询当作余额验证。
 
 ## 中央配置
 

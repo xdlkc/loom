@@ -26,6 +26,10 @@ try {
   await writeFile(join(data, "providers.json"), JSON.stringify({ providers: { wallet: {
     enabled: true, baseURL: "https://api.deepseek.com", keyFile: join(data, "unused.key"),
     models: ["deepseek-flash", "deepseek-v4-pro"].map(id => ({ id, reasoning: true, input: ["text"], maxTokens: 128, contextWindow: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
+  }, meituan: {
+    prefix: "longcat", enabled: true, baseURL: "https://api.longcat.chat/openai/v1", keyFile: join(data, "unused-longcat.key"),
+    piCompat: {thinkingFormat: "deepseek", supportsReasoningEffort: false},
+    models: [{id: "LongCat-2.5", reasoning: true, input: ["text"], maxTokens: 128, contextWindow: 8192, cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}}],
   } } }));
   execFileSync(resolve(binary), ["sync"], { env: { ...process.env, HOME: root, MODEL_HUB_DATA_DIR: data }, stdio: "pipe" });
   const pi = JSON.parse(await readFile(join(root, ".pi/agent/models.json"), "utf8"));
@@ -39,11 +43,11 @@ try {
       const body = captured.at(-1);
       assert.equal(body.model, entry.id);
       assert.equal(body.thinking?.type, level === "off" ? "disabled" : "enabled");
-      assert.equal(body.reasoning_effort ?? null, effort);
+      assert.equal(body.reasoning_effort ?? null, entry.id.startsWith("longcat/") ? null : effort);
     }
   }
-  assert.equal(captured.length, 14);
-  console.log("PASS: real pi SDK sent 14 requests to a loopback fixture; off/on and all effort levels agree.");
+  assert.equal(captured.length, 21);
+  console.log("PASS: real pi SDK sent 21 loopback requests; DeepSeek effort mapping and LongCat thinking toggles agree.");
 } finally {
   await new Promise(resolve => server.close(resolve));
   await rm(root, { recursive: true, force: true });

@@ -7,6 +7,7 @@ fn hidden_keys_require_a_terminal_and_never_accept_piped_credentials() {
         vec!["add"],
         vec!["add", "zenmux", "deepseek"],
         vec!["configure", "kimi"],
+        vec!["add", "longcat"],
         vec!["add", "--custom"],
     ] {
         let r = Command::new(env!("CARGO_BIN_EXE_loom"))

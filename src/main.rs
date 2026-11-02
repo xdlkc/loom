@@ -229,6 +229,10 @@ mod tests {
                 "https://api.kimi.com/coding/v1",
                 "https://api.kimi.com/coding/v1/messages",
             ),
+            (
+                "https://api.longcat.chat/openai/v1",
+                "https://api.longcat.chat/anthropic/v1/messages",
+            ),
         ] {
             assert_eq!(
                 config::anthropic(&json!({"baseURL":base}))
@@ -237,6 +241,18 @@ mod tests {
                 native
             );
         }
+    }
+    #[test]
+    fn longcat_auth_follows_the_resolved_native_host() {
+        assert!(config::anthropic_bearer(
+            &json!({"baseURL":"https://api.longcat.chat/openai/v1"})
+        ));
+        assert!(config::anthropic_bearer(
+            &json!({"baseURL":"https://custom.invalid/v1","anthropicBaseURL":"https://api.longcat.chat/anthropic"})
+        ));
+        assert!(!config::anthropic_bearer(
+            &json!({"prefix":"longcat","baseURL":"https://api.deepseek.com"})
+        ));
     }
     #[test]
     fn config_private_idempotent() {
