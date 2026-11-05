@@ -246,6 +246,48 @@ fn opencode_model(m: &Model, label: String) -> Value {
     }
     v
 }
+// A JSONC file without comments is ordinary JSON. Comments are detected outside
+// string literals so URLs such as https://example.invalid remain valid.
+fn has_jsonc_comment(raw: &[u8]) -> bool {
+    let mut string = false;
+    let mut escape = false;
+    for (i, b) in raw.iter().copied().enumerate() {
+        if string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                string = false;
+            }
+        } else if b == b'"' {
+            string = true;
+        } else if b == b'/'
+            && matches!(raw.get(i + 1).copied(), Some(b'/' | b'*'))
+        {
+            return true;
+        }
+    }
+    false
+}
+fn opencode_config_path(h: &Path) -> Result<PathBuf> {
+    let json = h.join(".config/opencode/opencode.json");
+    let jsonc = json.with_extension("jsonc");
+    match (json.exists(), jsonc.exists()) {
+        (true, true) => Err("JSON and JSONC client configs both exist; not overwritten".into()),
+        (false, true) => {
+            let raw = fs::read(&jsonc)?;
+            if has_jsonc_comment(&raw) {
+                return Err("JSONC client config contains comments; not overwritten".into());
+            }
+            if serde_json::from_slice::<Value>(&raw).is_err() {
+                return Err("invalid JSONC client config; not overwritten".into());
+            }
+            Ok(jsonc)
+        }
+        _ => Ok(json),
+    }
+}
 pub fn sync(d: &Path, h: &Path) -> Result<()> {
     sync_for_port(d, h, 4319)
 }
@@ -263,10 +305,7 @@ pub fn sync_for_port(d: &Path, h: &Path, port: u16) -> Result<()> {
     let key = d.join("hub.key");
     let pp = h.join(".pi/agent/models.json");
     let sp = h.join(".pi/agent/settings.json");
-    let op = h.join(".config/opencode/opencode.json");
-    if op.with_extension("jsonc").exists() {
-        return Err("JSONC exists; not overwritten".into());
-    }
+    let op = opencode_config_path(h)?;
     let mut pi = read_or(&pp)?;
     let mut settings = read_or(&sp)?;
     let mut oc = read_or(&op)?;
@@ -408,123 +447,5 @@ pub fn prompt(s: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn sync_preserves_oauth_preferences_and_never_exports_upstream_keys() {
-        let t = tempfile::tempdir().unwrap();
-        let d = t.path().join("data");
-        let h = t.path().join("home");
-        init(&d).unwrap();
-        let kp = d.join("keys/test.key");
-        write(&kp, b"UPSTREAM_FIXTURE").unwrap();
-        save(&d.join("providers.json"),&json!({"proxy":"","providers":{"local-test":{"prefix":"test","name":"Test","enabled":true,"baseURL":"https://api.deepseek.com","keyFile":kp,"models":[{"id":"deepseek-flash","name":"Flash"}]}}})).unwrap();
-        save(
-            &h.join(".pi/agent/models.json"),
-            &json!({"providers":{"oauth":{"name":"original"}}}),
-        )
-        .unwrap();
-        save(
-            &h.join(".claude/settings.json"),
-            &json!({"theme":"dark","permissions":{"defaultMode":"manual"}}),
-        )
-        .unwrap();
-        sync(&d, &h).unwrap();
-        let pi = read(&h.join(".pi/agent/models.json")).unwrap();
-        assert_eq!(pi["providers"]["oauth"]["name"], "original");
-        let c = read(&h.join(".claude/settings.json")).unwrap();
-        assert_eq!(c["theme"], "dark");
-        assert_eq!(c["permissions"]["defaultMode"], "manual");
-        assert!(
-            !serde_json::to_string(&c)
-                .unwrap()
-                .contains("UPSTREAM_FIXTURE")
-        );
-        assert!(c["apiKeyHelper"].as_str().unwrap().contains("hub.key"));
-        let before = fs::read(h.join(".claude/settings.json")).unwrap();
-        sync(&d, &h).unwrap();
-        assert_eq!(before, fs::read(h.join(".claude/settings.json")).unwrap());
-    }
-    #[test]
-    fn registry_rejects_duplicate_or_insecure_routes() {
-        let mut r = json!({"providers":{"local-test":{"enabled":true,"baseURL":"http://unsafe.invalid","keyFile":"fixture","models":[{"id":"x"}]}}});
-        assert!(catalog(&r).is_err());
-        r["providers"]["local-test"]["baseURL"] = json!("https://safe.invalid");
-        r["providers"]["local-test"]["models"] = json!([{"id":"x"},{"id":"x"}]);
-        assert!(catalog(&r).is_err());
-    }
-    #[test]
-    fn thinking_metadata_follows_upstream_and_preserves_preferences() {
-        let t = tempfile::tempdir().unwrap();
-        let d = t.path().join("data");
-        let h = t.path().join("home");
-        init(&d).unwrap();
-        let registry = json!({"providers":{
-            "custom-route":{"prefix":"wallet","enabled":true,"baseURL":"https://api.deepseek.com/v1","keyFile":"fixture","models":[{"id":"deepseek-flash","reasoning":true},{"id":"deepseek-v4-pro","reasoning":true}]},
-            "not-deepseek":{"prefix":"deepseek","enabled":true,"baseURL":"https://other.invalid","keyFile":"fixture","models":[{"id":"deepseek-flash","reasoning":true},{"id":"plain","reasoning":false}]}
-        }});
-        save(&d.join("providers.json"), &registry).unwrap();
-        let preferences = json!({"defaultProvider":"native","defaultModel":"keep","defaultThinkingLevel":"off","modelThinkingLevels":{"hub/wallet/deepseek-flash":"high"},"theme":"dark"});
-        save(&h.join(".pi/agent/settings.json"), &preferences).unwrap();
-        sync(&d, &h).unwrap();
-        assert_eq!(read(&d.join("providers.json")).unwrap(), registry);
-        assert_eq!(
-            read(&h.join(".pi/agent/settings.json")).unwrap(),
-            preferences
-        );
-        let pi = read(&h.join(".pi/agent/models.json")).unwrap();
-        let oc = read(&h.join(".config/opencode/opencode.json")).unwrap();
-        for id in ["wallet/deepseek-flash", "wallet/deepseek-v4-pro"] {
-            let m = pi["providers"]["hub"]["models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|m| m["id"] == id)
-                .unwrap();
-            assert_eq!(m["compat"]["thinkingFormat"], "deepseek");
-            assert_eq!(m["compat"]["supportsReasoningEffort"], true);
-            assert_eq!(m["thinkingLevelMap"]["medium"], "high");
-            assert_eq!(m["thinkingLevelMap"]["max"], "max");
-            let m = &oc["providers"]["hub"]["models"][id];
-            assert_eq!(m["capabilities"]["reasoning"]["supported"], true);
-            assert_eq!(m["compatibility"]["reasoningField"], "reasoning_content");
-            let off = &m["variants"][0];
-            assert_eq!(off["id"], "none");
-            assert_eq!(off["body"]["thinking"]["type"], "disabled");
-            assert!(off["body"].get("reasoning_effort").is_none());
-        }
-        let other = pi["providers"]["hub"]["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["id"] == "deepseek/deepseek-flash")
-            .unwrap();
-        assert!(other["compat"].get("thinkingFormat").is_none());
-        assert!(
-            oc["providers"]["hub"]["models"]["deepseek/deepseek-flash"]
-                .get("variants")
-                .is_none()
-        );
-        assert_eq!(
-            oc["providers"]["hub"]["models"]["deepseek/plain"]["capabilities"]["reasoning"]["supported"],
-            false
-        );
-        let before = fs::read(h.join(".pi/agent/models.json")).unwrap();
-        sync(&d, &h).unwrap();
-        assert_eq!(fs::read(h.join(".pi/agent/models.json")).unwrap(), before);
-    }
-    #[test]
-    fn explicit_pi_compat_and_level_overrides_survive_sync() {
-        let m = Model {
-            id: "custom/deepseek-flash".into(),
-            p: json!({"baseURL":"https://api.deepseek.com","piCompat":{"supportsUsageInStreaming":false,"thinkingFormat":"zai"}}),
-            m: json!({"id":"deepseek-flash","reasoning":true,"compat":{"thinkingFormat":"deepseek","supportsReasoningEffort":false},"thinkingLevelMap":{"off":null,"medium":"max"}}),
-        };
-        let pi = pi_model(&m, "fixture".into());
-        assert_eq!(pi["compat"]["thinkingFormat"], "deepseek");
-        assert_eq!(pi["compat"]["supportsUsageInStreaming"], false);
-        assert_eq!(pi["compat"]["supportsReasoningEffort"], false);
-        assert_eq!(pi["thinkingLevelMap"]["medium"], "max");
-        assert_eq!(pi["thinkingLevelMap"]["off"], Value::Null);
-    }
-}
+#[path = "config_tests.rs"]
+mod tests;
