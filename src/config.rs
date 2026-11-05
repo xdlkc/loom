@@ -27,6 +27,43 @@ pub fn read(p: &Path) -> Result<Value> {
 pub fn read_or(p: &Path) -> Result<Value> {
     if p.exists() { read(p) } else { Ok(json!({})) }
 }
+// OpenCode also reads opencode.jsonc. Merging into it is safe only when it is a
+// comment-free JSON document: rewriting would otherwise drop user comments, and
+// two config files side by side makes the effective one ambiguous.
+fn has_comments(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut string = false;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if string => i += 1,
+            b'"' => string = !string,
+            b'/' if !string && (b.get(i + 1) == Some(&b'/') || b.get(i + 1) == Some(&b'*')) => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+pub fn opencode_file(h: &Path) -> Result<PathBuf> {
+    let json = h.join(".config/opencode/opencode.json");
+    let jsonc = h.join(".config/opencode/opencode.jsonc");
+    if !jsonc.exists() {
+        return Ok(json);
+    }
+    if json.exists() {
+        return Err("opencode.json and opencode.jsonc both exist; not overwritten".into());
+    }
+    let text = fs::read_to_string(&jsonc)?;
+    if has_comments(&text) {
+        return Err("opencode.jsonc contains comments; not overwritten".into());
+    }
+    serde_json::from_str::<Value>(&text)
+        .map_err(|_| "opencode.jsonc is not comment-free JSON; not overwritten")?;
+    Ok(jsonc)
+}
 pub fn write(p: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     fs::create_dir_all(p.parent().ok_or("parent required")?)?;
@@ -263,10 +300,7 @@ pub fn sync_for_port(d: &Path, h: &Path, port: u16) -> Result<()> {
     let key = d.join("hub.key");
     let pp = h.join(".pi/agent/models.json");
     let sp = h.join(".pi/agent/settings.json");
-    let op = h.join(".config/opencode/opencode.json");
-    if op.with_extension("jsonc").exists() {
-        return Err("JSONC exists; not overwritten".into());
-    }
+    let op = opencode_file(h)?;
     let mut pi = read_or(&pp)?;
     let mut settings = read_or(&sp)?;
     let mut oc = read_or(&op)?;
@@ -526,5 +560,75 @@ mod tests {
         assert_eq!(pi["compat"]["supportsReasoningEffort"], false);
         assert_eq!(pi["thinkingLevelMap"]["medium"], "max");
         assert_eq!(pi["thinkingLevelMap"]["off"], Value::Null);
+    }
+    fn jsonc_fixture(workspace: &Path) -> (PathBuf, PathBuf) {
+        let d = workspace.join("data");
+        let h = workspace.join("home");
+        init(&d).unwrap();
+        save(&d.join("providers.json"), &json!({"proxy":"","providers":{"local-test":{"prefix":"test","name":"Test","enabled":true,"baseURL":"https://api.deepseek.com","keyFile":"fixture","models":[{"id":"deepseek-flash","name":"Flash"}]}}})).unwrap();
+        (d, h)
+    }
+    #[test]
+    fn sync_merges_comment_free_jsonc_in_place_and_keeps_preferences() {
+        let t = tempfile::tempdir().unwrap();
+        let (d, h) = jsonc_fixture(t.path());
+        let oc = h.join(".config/opencode/opencode.jsonc");
+        write(
+            &oc,
+            br#"{"model":"native/keep","plugins":[{"package":"existing"}],"theme":"dark","providers":{"native":{"name":"native"}}}"#,
+        )
+        .unwrap();
+        sync(&d, &h).unwrap();
+        assert!(!h.join(".config/opencode/opencode.json").exists());
+        let v = read(&oc).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["model"], "native/keep");
+        assert_eq!(v["providers"]["native"]["name"], "native");
+        assert!(
+            v["providers"]["hub"]["models"]
+                .get("test/deepseek-flash")
+                .is_some()
+        );
+        let plugins = v["plugins"].as_array().unwrap();
+        assert!(plugins.iter().any(|p| p["package"] == "existing"));
+        assert!(plugins.iter().any(|p| {
+            p["package"]
+                .as_str()
+                .is_some_and(|s| s.contains("loom-observability"))
+        }));
+        // A second sync must stay stable and keep the JSONC file valid JSON.
+        let before = fs::read(&oc).unwrap();
+        sync(&d, &h).unwrap();
+        assert_eq!(before, fs::read(&oc).unwrap());
+        assert!(read(&oc).is_ok());
+    }
+    #[test]
+    fn sync_refuses_jsonc_with_comments_or_ambiguous_dual_configs() {
+        let t = tempfile::tempdir().unwrap();
+        let (d, h) = jsonc_fixture(t.path());
+        let oc = h.join(".config/opencode/opencode.jsonc");
+        let original = b"{\n  // keep this note\n  \"theme\": \"dark\"\n}\n".to_vec();
+        write(&oc, &original).unwrap();
+        assert!(sync(&d, &h).is_err());
+        assert_eq!(fs::read(&oc).unwrap(), original);
+        assert!(!h.join(".config/opencode/opencode.json").exists());
+        write(
+            &oc,
+            br#"{"theme":"dark","url":"https://example.invalid/a//b"}"#,
+        )
+        .unwrap();
+        assert!(sync(&d, &h).is_ok());
+        write(&oc, br#"{"theme":"dark"}"#).unwrap();
+        write(&h.join(".config/opencode/opencode.json"), b"{}").unwrap();
+        assert!(sync(&d, &h).is_err());
+    }
+    #[test]
+    fn comment_detection_ignores_strings() {
+        assert!(!has_comments(
+            r#"{"a":"// not a comment","b":"/* nor this */"}"#
+        ));
+        assert!(!has_comments(r#"{"a":"escaped \" quote"}"#));
+        assert!(has_comments("{\n// line\n}"));
+        assert!(has_comments("{/* block */}"));
     }
 }
