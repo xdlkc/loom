@@ -336,7 +336,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         Ok(v) => v,
         Err(_) => return recorded_error(&mut trace, native, 503, "PROVIDER_KEY_UNAVAILABLE"),
     };
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::network::client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))

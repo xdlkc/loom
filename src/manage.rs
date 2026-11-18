@@ -995,7 +995,7 @@ pub async fn verify_provider(
         }
     };
 
-    let mut builder = reqwest::Client::builder()
+    let mut builder = network::client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -1206,6 +1206,15 @@ pub async fn run_doctor(
             "直连（Loom 不读取终端 HTTPS_PROXY）"
         }
     );
+    let (system_roots, had_load_errors) = network::system_root_status();
+    println!(
+        "  [i] TLS 证书与主机名校验已开启。本次自检加载了 {system_roots} 张系统根证书和内置 Mozilla WebPKI 根证书。"
+    );
+    if system_roots == 0 {
+        println!("  [!] 本次自检使用内置公共根证书。需要信任企业 CA 时，请检查系统信任库。");
+    } else if had_load_errors {
+        println!("  [!] 部分系统根证书加载失败，已使用成功加载的证书继续校验。");
+    }
 
     println!("\n[3/4] 后台服务与客户端同步");
     let gw_ok = snap["gateway"]["healthy"] == true;

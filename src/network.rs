@@ -1,5 +1,44 @@
 use crate::config::{self, Result};
-use std::{error::Error, path::Path};
+use std::{error::Error, path::Path, sync::OnceLock};
+
+struct UpstreamTls {
+    config: rustls::ClientConfig,
+    system_roots: usize,
+    had_load_errors: bool,
+}
+
+fn upstream_tls() -> &'static UpstreamTls {
+    // Load the platform trust store once per process, since the gateway builds
+    // a client for each request to pick up proxy configuration changes.
+    static TLS: OnceLock<UpstreamTls> = OnceLock::new();
+    TLS.get_or_init(|| {
+        let native = rustls_native_certs::load_native_certs();
+        let mut roots = rustls::RootCertStore::empty();
+        let (system_roots, skipped) = roots.add_parsable_certificates(native.certs);
+        // Bundled roots remain available even if no system certificates load.
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // Match reqwest's ALPN configuration with the enabled HTTP features.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        UpstreamTls {
+            config,
+            system_roots,
+            had_load_errors: skipped > 0 || !native.errors.is_empty(),
+        }
+    })
+}
+
+pub fn system_root_status() -> (usize, bool) {
+    let tls = upstream_tls();
+    (tls.system_roots, tls.had_load_errors)
+}
+
+pub fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().use_preconfigured_tls(upstream_tls().config.clone())
+}
 
 // Error chains can contain URLs and credentials. Inspect in memory; return only
 // fixed categories and guidance, never a source's display text.
@@ -32,7 +71,7 @@ pub fn failure(e: &reqwest::Error) -> (&'static str, &'static str) {
         {
             return (
                 "tls_error",
-                "TLS 握手或证书验证失败，请检查系统时间、代理和证书链；保持证书验证开启。",
+                "TLS 握手或证书验证失败，请检查系统时间、代理和证书链。若使用企业网关，请确认其根 CA 已加入系统信任库并重启 Loom 服务。",
             );
         }
         if [

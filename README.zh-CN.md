@@ -108,6 +108,7 @@ Loom 在编译期嵌入 [catalog/zenmux.json](catalog/zenmux.json)、[catalog/gl
 - **原样流式透传**：SSE 增量分片、思考字段、工具调用、图片、缓存参数与厂商字段均原样透传；`max_tokens`（或 `max_completion_tokens`）受中央配置 `maxTokens` 上限约束。网关限制请求体最大 `20 MiB`（`30s` 读取超时）、响应体最大 `64 MiB`、并发推理信号量上限 `8`（超出返回 `429 LOCAL_CONCURRENCY_LIMIT`）。
 - **原生 Anthropic 路由**：自动映射 ZenMux（`https://zenmux.ai/api/anthropic`）、GLM（`https://open.bigmodel.cn/api/anthropic`、`https://api.z.ai/api/anthropic`）、MiniMax（`https://api.minimax.cn/anthropic`、`.minimaxi.com`、`.minimax.io`）、DeepSeek（`https://api.deepseek.com/anthropic`）、Kimi Code（`https://api.kimi.com/coding`）与 LongCat（`https://api.longcat.chat/anthropic`，按上游要求使用 Bearer 认证），自定义供应商可配置 `anthropicBaseURL`。
 - **上游 402 账单分类**：保留 HTTP `402` 与 `UPSTREAM_402` 机器码，仅按白名单错误码输出固定中文说明（`subscription_quota_exhausted`、`insufficient_credit` 或 `payment_required`），不回显上游任意错误文本。
+- **上游 TLS 校验**使用系统信任库和内置 Mozilla WebPKI 根证书，适用于推理请求及供应商连通性检测。系统信任库无法加载时，仍使用内置根证书校验证书与主机名。企业网络使用自有 CA 时，将根证书加入系统信任库后重启 Loom 服务。`loom doctor` 会显示命令行进程载入的系统根证书数量。Loom 进程设置 `SSL_CERT_FILE` 或 `SSL_CERT_DIR` 时，这些路径会替代默认的系统根证书来源。
 - **网络传输 502 分类**：保留 HTTP `502` 与 `UPSTREAM_UNAVAILABLE`，按 `timeout`、`request_invalid`、`tls_error`、`dns_error`、`connect_failed`、`transport_failed` 输出固定诊断分类，不暴露上游 URL 或凭据。
 
 ---
