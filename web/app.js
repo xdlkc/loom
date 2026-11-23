@@ -27,6 +27,7 @@ const STATUS_LABELS = {
   cancelled: '已取消',
   interrupted: '服务中断',
   inflight: '进行中',
+  untracked: '未经网关',
 };
 
 const state = {
@@ -50,6 +51,13 @@ const state = {
   generation: 0,
   toastTimer: null,
   editingProviderId: null,
+  providerUi: {},
+  sessionDom: null,
+  sessionLoadedId: null,
+  sessionJump: null,
+  sessionError: null,
+  sessionLoadingId: null,
+  sessionLoadToken: 0,
 };
 
 const num = (n) =>
@@ -65,6 +73,26 @@ const ms = (n) =>
 const dateStr = (n) => (n ? new Date(n).toLocaleString('zh-CN', { hour12: false }) : '—');
 const timeOnly = (n) =>
   n ? new Date(n).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+const shortDate = (n) =>
+  n
+    ? new Date(n).toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      })
+    : '—';
+// Elapsed time for timeline offsets: seconds under a minute, then two larger units.
+const dur = (n) => {
+  if (n == null) return '—';
+  if (n < 60000) return `${(n / 1000).toFixed(1)} s`;
+  const pad = (v) => String(v).padStart(2, '0');
+  if (n < 3600000) return `${Math.floor(n / 60000)}m ${pad(Math.floor((n % 60000) / 1000))}s`;
+  return `${Math.floor(n / 3600000)}h ${pad(Math.floor((n % 3600000) / 60000))}m`;
+};
+const harnessLabel = (h) => HARNESS_LABELS[h] || h || '未识别';
 
 function el(tag, cls, text) {
   const node = document.createElement(tag);
@@ -102,18 +130,18 @@ function pill(text, kind = '') {
   return el('span', kind ? `pill ${kind}` : 'pill', text);
 }
 
+const STATUS_KINDS = { inflight: 'pending', untracked: 'neutral' };
 function statusPill(s) {
-  const cls = ['failed', 'partial', 'cancelled', 'interrupted'].includes(s)
+  const kind = ['failed', 'partial', 'cancelled', 'interrupted'].includes(s)
     ? 'bad'
-    : s === 'inflight'
-      ? 'pending'
-      : '';
-  return pill(STATUS_LABELS[s] || s, cls);
+    : STATUS_KINDS[s] || '';
+  return pill(STATUS_LABELS[s] || s, kind);
 }
 
-function toast(message) {
+function toast(message, kind = '') {
   const node = $('#toast');
   node.textContent = message;
+  node.className = kind ? `toast ${kind}` : 'toast';
   node.hidden = false;
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => {
@@ -178,17 +206,17 @@ function updateGatewayPill(setup) {
   if (!setup) {
     box.className = 'health-pill';
     label.textContent = '等待登录连接';
+    box.title = '';
     return;
   }
   const gw = setup.gateway || {};
   const readyCount = setup.ready_model_count || 0;
-  if (gw.healthy) {
-    box.className = 'health-pill ok';
-    label.textContent = `网关运行中 · 127.0.0.1:${gw.port} · ${readyCount} 个可用模型`;
-  } else {
-    box.className = 'health-pill bad';
-    label.textContent = `网关未响应 (127.0.0.1:${gw.port})`;
-  }
+  box.className = `health-pill ${gw.healthy ? 'ok' : 'bad'}`;
+  label.textContent = gw.healthy
+    ? `网关运行中 · 127.0.0.1:${gw.port} · ${readyCount} 个可用模型`
+    : `网关未响应 (127.0.0.1:${gw.port})`;
+  // Narrow layouts collapse the pill to its status dot.
+  box.title = label.textContent;
   $('#quick-sync').hidden = readyCount === 0;
 }
 
@@ -213,6 +241,7 @@ function filters() {
     provider: $('#provider').value,
     model: $('#model').value,
     harness: $('#harness').value,
+    status: state.page === 'requests' ? $('#status').value : '',
   };
 }
 
@@ -308,6 +337,7 @@ function renderTestFeedback(pid) {
 }
 
 async function runConnectivityTest(pid, modelId, triggerBtn) {
+  const idleLabel = triggerBtn?.textContent;
   if (triggerBtn) {
     triggerBtn.disabled = true;
     triggerBtn.textContent = '检测中…';
@@ -318,13 +348,15 @@ async function runConnectivityTest(pid, modelId, triggerBtn) {
       body: JSON.stringify({ provider_id: pid, model_id: modelId || null }),
     });
     state.testResults[pid] = res;
-    toast(res.ok ? '连通性检测通过' : '连通性检测发现异常');
+    toast(res.ok ? '连通性检测通过' : '连通性检测发现异常', res.ok ? '' : 'bad');
     await refresh();
   } catch (e) {
     showError(e);
   } finally {
+    // Without a re-render (for example on failure) the button would stay labelled as busy.
     if (triggerBtn) {
       triggerBtn.disabled = false;
+      triggerBtn.textContent = idleLabel;
     }
   }
 }
@@ -384,7 +416,13 @@ async function renderOnboarding() {
       add(
         el('div'),
         el('h3', '', '验证连通并开始调用'),
-        el('p', 'small-note', '不上传云端，随时可回工作台更换 Key 或切换模型'),
+        el(
+          'p',
+          'small-note',
+          hasModels && anySynced
+            ? '调用会自动出现在「概览」；连通性可在「厂商」页随时复测'
+            : '保存 Key 后自动检测连通性，随时可回工作台更换 Key 或切换模型',
+        ),
       ),
     ),
   );
@@ -429,7 +467,7 @@ async function renderOnboarding() {
       statusBadge,
     );
 
-    const pitfall = el('div', 'pitfall-box', `注意：${p.pitfall_hint}（${p.key_hint}）`);
+    const pitfall = el('div', 'pitfall-box', `注意：${p.pitfall_hint}`);
     const linkRow = el('div', 'vendor-links');
     const getKeyLink = el('a', '', '前往官网获取 Key ↗');
     getKeyLink.href = p.key_url;
@@ -466,6 +504,7 @@ async function renderOnboarding() {
         input.focus();
         return;
       }
+      const idleLabel = saveBtn.textContent;
       saveBtn.disabled = true;
       saveBtn.textContent = keyVal ? '保存并检测…' : '检测中…';
       try {
@@ -477,7 +516,7 @@ async function renderOnboarding() {
           });
           targetPid = saved.provider_id;
           input.value = '';
-          if (saved.sync_warning) toast(saved.sync_warning);
+          if (saved.sync_warning) toast(saved.sync_warning, 'warn');
         }
         if (targetPid) {
           const testRes = await api('/api/providers/test', {
@@ -485,7 +524,10 @@ async function renderOnboarding() {
             body: JSON.stringify({ provider_id: targetPid }),
           });
           state.testResults[targetPid] = testRes;
-          toast(testRes.ok ? `${p.name} 已配置并连通` : `${p.name} 已保存，但连通性待检查`);
+          toast(
+            testRes.ok ? `${p.name} 已配置并连通` : `${p.name} 已保存，但连通性待检查`,
+            testRes.ok ? '' : 'warn',
+          );
         }
         await refresh();
       } catch (err) {
@@ -493,6 +535,7 @@ async function renderOnboarding() {
         localHint.hidden = false;
       } finally {
         saveBtn.disabled = false;
+        saveBtn.textContent = idleLabel;
       }
     });
 
@@ -600,8 +643,8 @@ function renderConfiguredProviderCard(p) {
     el('div', 'vendor-meta'),
     pill(`hub/${p.prefix}/*`, 'neutral'),
     pill(p.billing, 'neutral'),
-    p.anthropic_supported ? pill('支持 Anthropic 原生', '') : null,
-    p.has_key ? pill('Key 已安全保存', '') : pill('缺少 Key 文件', 'bad'),
+    p.anthropic_supported ? pill('支持 Anthropic 原生', 'neutral') : null,
+    p.has_key ? pill('Key 已安全保存', 'neutral') : pill('缺少 Key 文件', 'bad'),
     p.enabled ? pill(`已启用 · ${p.active_model_count} 模型`, '') : pill('已停用', 'warn'),
   );
 
@@ -613,6 +656,14 @@ function renderConfiguredProviderCard(p) {
   if (!modelSelect.options.length && p.models.length) {
     modelSelect.add(new Option(p.models[0].id, p.models[0].id));
   }
+  // Every action re-renders the page; keep per-provider control state outside the DOM.
+  const ui = (state.providerUi[p.id] = state.providerUi[p.id] || {});
+  if ([...modelSelect.options].some((o) => o.value === ui.testModel)) {
+    modelSelect.value = ui.testModel;
+  }
+  modelSelect.addEventListener('change', () => {
+    ui.testModel = modelSelect.value;
+  });
 
   const testBtn = btn('测试连通性', 'btn btn-sm', () =>
     runConnectivityTest(p.id, modelSelect.value, testBtn),
@@ -722,6 +773,10 @@ function renderConfiguredProviderCard(p) {
 
   // Models disclosure
   const modelsBox = el('details', 'models-box');
+  modelsBox.open = !!ui.modelsOpen;
+  modelsBox.addEventListener('toggle', () => {
+    ui.modelsOpen = modelsBox.open;
+  });
   add(
     modelsBox,
     el(
@@ -921,7 +976,7 @@ async function renderProviders() {
       add(
         card,
         add(el('div', 'vendor-head'), el('strong', '', p.name), pill(p.region_hint, 'neutral')),
-        el('div', 'small-note', `${p.key_hint} · ${p.pitfall_hint}`),
+        el('div', 'small-note', `注意：${p.pitfall_hint}`),
         link,
         form,
       );
@@ -1089,13 +1144,25 @@ async function renderIntegrations() {
           : pill('macOS 支持桌面应用', 'warn')
         : pill('当前为 Linux 环境', 'neutral'),
     ),
-    el(
-      'p',
-      'small-note',
-      setup.desktop_app?.supported
-        ? '在 macOS 上可通过 ~/Applications/Loom.app 在状态栏快速开关后台服务并免命令直达此工作台；也可在终端运行 `loom` 打开交互菜单或 `loom doctor --ping` 一键体检。'
-        : '随时可在终端运行 `loom` 进入交互式控制菜单、`loom doctor --ping` 实测厂商连通性，或运行 `loom console` 打开此页面。',
-    ),
+    setup.desktop_app?.supported
+      ? add(
+          el('p', 'small-note'),
+          '在 macOS 上可通过 ~/Applications/Loom.app 在状态栏快速开关后台服务并免命令直达此工作台；也可在终端运行 ',
+          el('code', '', 'loom'),
+          ' 打开交互菜单，或运行 ',
+          el('code', '', 'loom doctor --ping'),
+          ' 一键体检。',
+        )
+      : add(
+          el('p', 'small-note'),
+          '随时可在终端运行 ',
+          el('code', '', 'loom'),
+          ' 进入交互式控制菜单、',
+          el('code', '', 'loom doctor --ping'),
+          ' 实测厂商连通性，或运行 ',
+          el('code', '', 'loom console'),
+          ' 打开此页面。',
+        ),
   );
   add(root, appCard);
 
@@ -1104,72 +1171,170 @@ async function renderIntegrations() {
 
 /* ==================== 4. 流量概览 Overview ==================== */
 
-function tokenChart(series, bucket, f) {
-  if (!series.length || series.every((s) => s.input_tokens == null && s.output_tokens == null)) {
+// Ticks at 1 / 2 / 5 × 10^n so gridlines read as round numbers instead of quarters of the maximum.
+function niceScale(max) {
+  if (!(max > 0)) return { max: 4, step: 1 };
+  const rough = max / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(rough));
+  const fraction = rough / magnitude;
+  const step = (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * magnitude;
+  return { max: step * 4, step };
+}
+
+// One unit for a whole axis: mixing "129万" with "964,743" reads as different quantities.
+function axisNumber(n, max) {
+  if (!n) return '0';
+  if (max >= 1e8) return `${Number((n / 1e8).toFixed(2))}亿`;
+  if (max >= 1e5) return `${Number((n / 1e4).toFixed(1))}万`;
+  return num(Math.round(n));
+}
+
+function bucketLabel(timestamp, bucketMs) {
+  const date = new Date(timestamp);
+  const options =
+    bucketMs === 86400000
+      ? { month: 'short', day: 'numeric' }
+      : { month: 'short', day: 'numeric', hour: '2-digit' };
+  if (date.getMinutes()) options.minute = '2-digit';
+  return date.toLocaleString('zh-CN', options);
+}
+
+// Input dwarfs output in agent traffic, so each series gets its own band and scale.
+function tokenChart(series, bucketMs) {
+  if (!series.length || series.every((s) => !s.requests)) {
+    return el('div', 'empty', '当前时间窗口内暂无经过网关的调用，发起一次对话后这里会自动绘制 Token 曲线。');
+  }
+  if (series.every((s) => s.input_tokens == null && s.output_tokens == null)) {
     return el('div', 'empty', '暂无已返回 usage 的网关调用。客户端发过一次对话后这里会自动绘制 Token 曲线。');
   }
-  const map = new Map(series.map((s) => [s.timestamp, s]));
-  const points = [];
-  for (let t = Math.floor(f.from / bucket) * bucket; t < f.to; t += bucket) {
-    points.push(map.get(t) || { timestamp: t, input_tokens: 0, output_tokens: 0 });
-  }
+  const X0 = 64;
+  const X1 = 786;
+  const HEIGHT = 332;
+  const bands = [
+    {
+      field: 'input_tokens',
+      label: '输入 Tokens',
+      top: 24,
+      bottom: 134,
+      line: 'chart-line',
+      dot: 'chart-dot-in',
+    },
+    {
+      field: 'output_tokens',
+      label: '输出 Tokens',
+      top: 190,
+      bottom: 300,
+      line: 'chart-line chart-output',
+      dot: 'chart-dot-out',
+    },
+  ];
   const svg = svgEl('svg', {
-    viewBox: '0 0 800 260',
+    viewBox: `0 0 800 ${HEIGHT}`,
     class: 'chart-svg',
     role: 'img',
     'aria-label': '输入与输出 Token 随时间变化曲线',
   });
-  const max = Math.max(1, ...points.map((s) => Math.max(s.input_tokens || 0, s.output_tokens || 0)));
-  for (let i = 0; i <= 4; i++) {
-    const y = 20 + i * 49;
+  const xAt = (i) => X0 + (i * (X1 - X0)) / Math.max(1, series.length - 1);
+  for (const band of bands) {
+    const { max, step } = niceScale(Math.max(...series.map((s) => s[band.field] || 0)));
+    const yAt = (n) => band.bottom - ((n || 0) * (band.bottom - band.top)) / max;
+    for (let tick = 0; tick <= 4; tick++) {
+      const y = yAt(tick * step);
+      svg.append(
+        svgEl('line', { x1: X0, x2: X1, y1: y, y2: y, class: 'chart-grid' }),
+        svgEl('text', { x: 4, y: y + 4, class: 'chart-label' }, axisNumber(tick * step, max)),
+      );
+    }
+    svg.append(svgEl('text', { x: X0, y: band.top - 8, class: 'chart-title' }, band.label));
     svg.append(
-      svgEl('line', { x1: 58, x2: 780, y1: y, y2: y, class: 'chart-grid' }),
-      svgEl('text', { x: 4, y: y + 4, class: 'chart-label' }, num(max * (1 - i / 4))),
+      svgEl(
+        'path',
+        {
+          d: series
+            .map((s, i) => `${i ? 'L' : 'M'}${xAt(i).toFixed(1)} ${yAt(s[band.field]).toFixed(1)}`)
+            .join(' '),
+          class: band.line,
+        },
+      ),
     );
+    if (series.length <= 60) {
+      series.forEach((s, i) => {
+        svg.append(
+          svgEl('circle', {
+            cx: xAt(i).toFixed(1),
+            cy: yAt(s[band.field]).toFixed(1),
+            r: 3,
+            class: band.dot,
+          }),
+        );
+      });
+    }
   }
-  const xAt = (i) => 58 + (i * 720) / Math.max(1, points.length - 1);
-  const yAt = (n) => 216 - ((n || 0) * 196) / max;
-  for (const [field, lineCls, dotCls, label] of [
-    ['input_tokens', 'chart-line', 'chart-dot-in', '输入'],
-    ['output_tokens', 'chart-line chart-output', 'chart-dot-out', '输出'],
-  ]) {
-    svg.append(
-      svgEl('path', {
-        d: points.map((s, i) => (i ? 'L' : 'M') + xAt(i).toFixed(1) + ' ' + yAt(s[field]).toFixed(1)).join(' '),
-        class: lineCls,
-      }),
-    );
-    points.forEach((s, i) => {
-      const c = svgEl('circle', { cx: xAt(i).toFixed(1), cy: yAt(s[field]).toFixed(1), r: 3, class: dotCls });
-      c.append(svgEl('title', {}, `${dateStr(s.timestamp)} · ${label} ${num(s[field])} Tokens`));
-      svg.append(c);
-    });
-  }
-  for (const i of [0, Math.floor((points.length - 1) / 2), points.length - 1]) {
-    const pt = points[i];
-    if (!pt) continue;
+
+  const labels = Math.min(series.length > 40 ? 4 : 6, series.length);
+  const shown = new Set(
+    Array.from({ length: labels }, (_, k) =>
+      Math.round((k * (series.length - 1)) / Math.max(1, labels - 1)),
+    ),
+  );
+  series.forEach((s, i) => {
+    if (!shown.has(i)) return;
     svg.append(
       svgEl(
         'text',
         {
           x: xAt(i).toFixed(1),
-          y: 248,
-          'text-anchor': i === 0 ? 'start' : i === points.length - 1 ? 'end' : 'middle',
+          y: HEIGHT - 6,
+          'text-anchor': i === 0 ? 'start' : i === series.length - 1 ? 'end' : 'middle',
           class: 'chart-label',
         },
-        new Date(pt.timestamp).toLocaleString('zh-CN', {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-        }),
+        bucketLabel(s.timestamp, bucketMs),
       ),
     );
-  }
-  return svg;
+  });
+
+  // Transparent hit columns drive a readout; a native tooltip needs hovering a 3px dot first.
+  const guide = svgEl('line', {
+    x1: X0,
+    x2: X0,
+    y1: 14,
+    y2: 304,
+    class: 'chart-guide',
+    visibility: 'hidden',
+  });
+  const readout = el('div', 'chart-readout');
+  const show = (i) => {
+    const s = series[i];
+    if (!s) return;
+    guide.setAttribute('x1', xAt(i));
+    guide.setAttribute('x2', xAt(i));
+    guide.setAttribute('visibility', 'visible');
+    readout.replaceChildren(
+      el('strong', '', bucketLabel(s.timestamp, bucketMs)),
+      el('span', '', `输入 ${num(s.input_tokens)}`),
+      el('span', '', `输出 ${num(s.output_tokens)}`),
+      el('span', '', `请求 ${num(s.requests)}`),
+    );
+  };
+  const width = (X1 - X0) / Math.max(1, series.length - 1);
+  series.forEach((_, i) => {
+    const hit = svgEl('rect', {
+      x: xAt(i) - width / 2,
+      y: 10,
+      width,
+      height: 300,
+      class: 'chart-hit',
+    });
+    hit.addEventListener('mouseenter', () => show(i));
+    svg.append(hit);
+  });
+  svg.append(guide);
+  show(series.length - 1);
+  return add(el('div', 'chart-box'), svg, readout);
 }
 
-async function renderOverview(f) {
-  const v = await api('/api/overview?' + qs(f));
+async function renderOverview() {
+  const v = await api('/api/overview?' + qs(filters()));
   syncFilterOptions(v.groups);
   const s = v.summary;
   const root = el('div', 'page-stack');
@@ -1217,12 +1382,7 @@ async function renderOverview(f) {
   const trendPanel = add(
     el('section', 'panel'),
     el('h2', '', 'Token 消耗趋势'),
-    tokenChart(v.series, v.bucket_ms, f),
-    add(
-      el('div', 'legend'),
-      add(el('span', 'legend-item'), el('i', 'legend-swatch in'), el('span', '', '输入 Tokens')),
-      add(el('span', 'legend-item'), el('i', 'legend-swatch out'), el('span', '', '输出 Tokens')),
-    ),
+    tokenChart(v.series, v.bucket_ms),
   );
 
   const byProvider = new Map();
@@ -1230,13 +1390,20 @@ async function renderOverview(f) {
     const k = g.provider || '未路由';
     byProvider.set(k, (byProvider.get(k) || 0) + (g.input_tokens || 0) + (g.output_tokens || 0));
   }
+  // A distribution is read top-down: rank it and show each share.
+  const ranked = [...byProvider].sort((a, b) => b[1] - a[1]);
+  const providerTotal = ranked.reduce((sum, [, n]) => sum + n, 0);
   const distPanel = add(
     el('section', 'panel'),
     el('h2', '', '供应商分布'),
-    byProvider.size
+    ranked.length
       ? tableEl(
-          ['供应商', 'Tokens'],
-          [...byProvider].map(([p, n]) => [p, num(n)]),
+          ['供应商', '占比', 'Tokens'],
+          ranked.map(([p, n]) => [
+            p,
+            shareBar(providerTotal ? n / providerTotal : null),
+            num(n),
+          ]),
         )
       : el('div', 'empty', '尚无经过 Loom 的网关调用'),
     el('p', 'small-note', '仅统计经过本机网关的真实调用。缺失 usage 保持未知（—）；厂商余额与历史导入不混入此处。'),
@@ -1255,7 +1422,7 @@ async function renderOverview(f) {
               $('#model').value = g.model || '';
               navigate('requests');
             }),
-            `${g.provider || '未路由'} / ${g.harness}`,
+            `${g.provider || '未路由'} / ${harnessLabel(g.harness)}`,
             `${num(g.input_tokens)} / ${num(g.output_tokens)}`,
             `${num(g.cache_read_tokens)} / ${num(g.cache_write_tokens)}`,
             pct(g.cache_hit_rate),
@@ -1296,6 +1463,38 @@ function timingBarSvg(waitMs, totalMs, isErr = false) {
   return svg;
 }
 
+// SVG rather than an inline width: the console CSP allows no inline styles.
+function shareBar(ratio) {
+  const svg = svgEl('svg', {
+    viewBox: '0 0 100 10',
+    preserveAspectRatio: 'none',
+    class: 'share-svg',
+    role: 'img',
+    'aria-label': `占比 ${pct(ratio)}`,
+  });
+  svg.append(svgEl('rect', { x: 0, y: 0, width: 100, height: 10, rx: 5, class: 'svg-track-soft' }));
+  if (ratio) {
+    svg.append(
+      svgEl('rect', {
+        x: 0,
+        y: 0,
+        width: Math.max(1, ratio * 100),
+        height: 10,
+        rx: 5,
+        class: 'svg-share-bar',
+      }),
+    );
+  }
+  return add(el('div', 'share'), svg, el('span', '', pct(ratio)));
+}
+
+// List rows repeat one date dozens of times; keep the full timestamp on hover.
+function timeCell(ts) {
+  const node = el('span', '', shortDate(ts));
+  node.title = dateStr(ts);
+  return node;
+}
+
 function showDetail(title, content) {
   $('#detail-title').textContent = title;
   $('#detail-content').replaceChildren(content);
@@ -1321,7 +1520,7 @@ async function openRequestDetail(id) {
     const kv = el('dl', 'kv-list');
     for (const [k, v] of [
       ['供应商 / 模型', `${r.provider || '—'} / ${r.model || '—'}`],
-      ['Harness / 协议', `${r.harness} / ${r.protocol}${r.streaming ? ' · SSE' : ''}`],
+      ['Harness / 协议', `${harnessLabel(r.harness)} / ${r.protocol}${r.streaming ? ' · SSE' : ''}`],
       ['状态 / HTTP', `${STATUS_LABELS[r.status] || r.status} / ${r.http}`],
       ['开始 / 总耗时', `${dateStr(r.started)} / ${ms(r.duration_ms)}`],
       ['输入 / 输出 Tokens', `${num(r.usage?.input)} / ${num(r.usage?.output)}`],
@@ -1330,6 +1529,10 @@ async function openRequestDetail(id) {
     ]) {
       add(kv, el('dt', '', k), el('dd', 'mono', v));
     }
+    kv.prepend(
+      el('dt', '', '请求 ID'),
+      add(el('dd'), el('span', 'mono', r.id), btn('复制', 'btn btn-sm', () => copyText(r.id))),
+    );
     add(root, kv);
 
     if (r.duration_ms != null) {
@@ -1340,8 +1543,7 @@ async function openRequestDetail(id) {
         root,
         btn('跳转到所属会话轨迹 →', 'btn btn-primary btn-sm', () => {
           $('#detail').close();
-          state.selectedSessionId = r.session;
-          navigate('sessions');
+          jumpToSession(r.session);
         }),
       );
     }
@@ -1368,7 +1570,7 @@ async function openRequestDetail(id) {
       rawFold('Loom → 上游（凭据已剥离）', r.forwarded),
       rawFold('上游 → 客户端 · 完整响应 / SSE 事件', r.response),
     );
-    showDetail(r.id, root);
+    showDetail(`${r.model || '未识别模型'} · ${dateStr(r.started)}`, root);
   } catch (err) {
     showError(err);
   }
@@ -1382,20 +1584,17 @@ async function renderRequests(f) {
     el('h2', '', `请求追踪 · 共 ${num(v.total)} 条`),
     v.items.length
       ? tableEl(
-          ['时间', '模型', '供应商', 'Harness', '状态', '输入 / 输出', '耗时', '所属会话'],
+          ['时间', '模型', '供应商', 'Harness', '状态', '输入 / 输出', '首 Token / 耗时', '所属会话'],
           v.items.map((r) => [
-            dateStr(r.started),
+            timeCell(r.started),
             btn(r.model || r.id, 'link-btn mono', () => openRequestDetail(r.id)),
             r.provider || '未路由',
-            HARNESS_LABELS[r.harness] || r.harness,
+            harnessLabel(r.harness),
             statusPill(r.status),
             `${num(r.input)} / ${num(r.output)}`,
-            ms(r.duration_ms),
+            `${ms(r.ttft_ms)} / ${ms(r.duration_ms)}`,
             r.session
-              ? btn('打开轨迹 →', 'link-btn', () => {
-                  state.selectedSessionId = r.session;
-                  navigate('sessions');
-                })
+              ? btn('打开轨迹 →', 'link-btn', () => jumpToSession(r.session))
               : el('span', 'small-note', '未关联'),
           ]),
         )
@@ -1450,16 +1649,13 @@ function extractReadablePayload(v) {
   return JSON.stringify(v, null, 2);
 }
 
+// The detail endpoint pages events; load up to this many automatically and offer the rest on demand.
+const SESSION_EVENT_CAP = 2000;
+
 function buildSessionSteps(detail) {
   const events = detail.events || [];
   const requests = detail.requests || [];
-  const reqByResp = new Map();
-  let reqCursor = 0;
-  for (const r of requests) {
-    if (r.id) reqByResp.set(r.id, r);
-  }
-
-  if (!events.length && requests.length) {
+  if (!events.length) {
     return requests.map((r, i) => ({
       index: i + 1,
       kind: 'model',
@@ -1470,11 +1666,14 @@ function buildSessionSteps(detail) {
       model: r.model || '未识别模型',
       text: `输入 ${num(r.input)} / 输出 ${num(r.output)} / 缓存读 ${num(r.cache_read)} Tokens`,
       requestId: r.id,
+      attempts: [],
       linkedRequest: r,
       raw: r,
     }));
   }
-
+  const byResponse = new Map();
+  for (const r of requests) if (r.response_id) byResponse.set(r.response_id, r);
+  const claimed = new Set();
   return events.map((e, i) => {
     const p = e.payload || {};
     const role = p.message?.role || e.kind || 'event';
@@ -1489,9 +1688,34 @@ function buildSessionSteps(detail) {
             x.type,
           ),
         ));
+    // Link by response id. Without one, the request behind a response is whichever started after
+    // the previous event and before the next: harnesses differ on whether an assistant message is
+    // stamped when the request starts or when the response lands, and both fall inside that window.
     let linkedRequest = null;
-    if ((role === 'assistant' || e.kind === 'assistant') && reqCursor < requests.length) {
-      linkedRequest = requests[reqCursor++];
+    let attempts = [];
+    const isResponse = role === 'assistant' || e.kind === 'assistant';
+    const matched = isResponse ? byResponse.get(e.response_id) || null : null;
+    // One response can be written as several events; only its first event carries the request.
+    const continuation = matched != null && claimed.has(matched);
+    if (isResponse && !continuation) {
+      const since = i ? events[i - 1].timestamp : null;
+      const until = events[i + 1]?.timestamp ?? Infinity;
+      attempts = requests.filter(
+        (r) =>
+          r !== matched &&
+          !claimed.has(r) &&
+          (since == null || r.started > since) &&
+          r.started < until,
+      );
+      if (matched) {
+        linkedRequest = matched;
+      } else {
+        // Prefer the latest request that actually completed; the rest read as earlier attempts.
+        const done = (r) => r.status === 'success' || r.status === 'partial';
+        linkedRequest = attempts.findLast(done) || attempts.at(-1) || null;
+        attempts = attempts.filter((r) => r !== linkedRequest);
+      }
+      if (linkedRequest) claimed.add(linkedRequest);
     }
     const title =
       role === 'user'
@@ -1501,17 +1725,24 @@ function buildSessionSteps(detail) {
           : role === 'assistant'
             ? `模型响应${linkedRequest?.model ? ' · ' + linkedRequest.model : ''}`
             : `事件 · ${e.kind}`;
-
     return {
       index: i + 1,
       kind: hasTool ? 'tool' : role === 'user' ? 'user' : 'model',
       title,
       role,
       timestamp: e.timestamp,
-      status: e.kind === 'import_error' ? 'failed' : linkedRequest?.status || 'success',
+      // Only a model response can have gone through the gateway; one without a matching request must
+      // not be reported as a success.
+      status:
+        e.kind === 'import_error'
+          ? 'failed'
+          : isResponse
+            ? (linkedRequest || matched)?.status || 'untracked'
+            : null,
       model: linkedRequest?.model || null,
       text,
       requestId: linkedRequest?.id || null,
+      attempts,
       linkedRequest,
       raw: e,
     };
@@ -1531,30 +1762,11 @@ function waterfallBarSvg(step, minTs, spanMs) {
   return svg;
 }
 
-function renderSessionWorkspace() {
-  const listData = state.sessionListData || { total: 0, items: [] };
+function mountSessionWorkspace() {
   const shell = el('div', 'session-shell');
 
-  // Left Pane: Session List
-  const sidebar = el('aside', 'session-sidebar');
-  const head = el('div', 'session-sidebar-head');
-  const titleRow = add(
-    el('div', 'session-sidebar-title'),
-    el('h2', '', `会话 · ${num(listData.total)}`),
-    btn('立即导入', 'btn btn-sm', async () => {
-      try {
-        await api('/api/import', { method: 'POST', body: '{}' });
-        toast('已完成本机原生会话增量导入');
-        await refresh();
-      } catch (err) {
-        showError(err);
-      }
-    }),
-  );
-
-  const searchRow = el('div', 'session-search-row');
+  // The list controls are mounted once: rebuilding them would drop focus while the user types.
   const searchInput = el('input');
-  searchInput.id = 'session-search';
   searchInput.type = 'text';
   searchInput.placeholder = '搜索标题或 ID（/ 聚焦）';
   searchInput.value = state.sessionSearch;
@@ -1565,282 +1777,508 @@ function renderSessionWorkspace() {
     searchTimer = setTimeout(() => {
       state.sessionSearch = searchInput.value;
       state.sessionOffset = 0;
+      state.sessionJump = null;
       refresh();
     }, 320);
   });
 
   const harnessSelect = el('select');
   harnessSelect.setAttribute('aria-label', '筛选客户端');
-  for (const [val, label] of [
-    ['', '全部'],
-    ['pi', 'pi'],
-    ['opencode2', 'opencode2'],
-    ['claude-code', 'Claude Code'],
-  ]) {
-    harnessSelect.add(new Option(label, val));
+  harnessSelect.add(new Option('全部', ''));
+  for (const [value, label] of Object.entries(HARNESS_LABELS)) {
+    if (value !== 'unknown') harnessSelect.add(new Option(label, value));
   }
   harnessSelect.value = state.sessionHarness;
   harnessSelect.addEventListener('change', () => {
     state.sessionHarness = harnessSelect.value;
     state.sessionOffset = 0;
+    state.sessionJump = null;
     refresh();
   });
 
-  add(searchRow, searchInput, harnessSelect);
-  add(head, titleRow, searchRow);
-  add(sidebar, head);
-
+  const title = el('h2', '', '会话');
+  const head = add(
+    el('div', 'session-sidebar-head'),
+    add(el('div', 'session-sidebar-title'), title, btn('立即导入', 'btn btn-sm', importSessions)),
+    add(el('div', 'session-search-row'), searchInput, harnessSelect),
+  );
   const listWrap = el('div', 'session-list');
-  if (!listData.items.length) {
-    add(listWrap, el('div', 'empty', '暂无匹配的本机会话。后台每 15 秒只读检查 pi / OpenCode / Claude Code 轨迹。'));
-  } else {
-    for (const s of listData.items) {
-      const selected = s.id === state.selectedSessionId;
-      const item = el('button', `session-card ${selected ? 'selected' : ''}`);
-      item.type = 'button';
-      const cov =
-        s.coverage === 'native'
-          ? pill('原生轨迹', '')
-          : s.coverage === 'partial'
-            ? pill('含解析异常', 'warn')
-            : pill('仅网关请求', 'neutral');
-      add(
-        item,
-        add(
-          el('div', 'session-card-top'),
-          el('span', 'session-card-title', s.title || s.native_id),
-          el('span', 'session-card-time', timeOnly(s.updated)),
-        ),
-        add(
-          el('div', 'session-card-sub'),
-          el('span', '', HARNESS_LABELS[s.harness] || s.harness),
-          el('span', '', `${num(s.events)} 事件`),
-          el('span', '', `${num(s.requests)} 请求`),
-          cov,
-        ),
-      );
-      item.addEventListener('click', () => {
-        state.selectedSessionId = s.id;
-        refresh();
-      });
-      add(listWrap, item);
-    }
-  }
-  add(
-    sidebar,
-    listWrap,
-    listData.total > 50
-      ? paginationEl(state.sessionOffset, listData.total, 50, (next) => {
-          state.sessionOffset = next;
-          refresh();
-        })
-      : null,
-  );
-  add(shell, sidebar);
-
-  // Center & Right Panes
-  const detail = state.sessionDetailData;
-  if (!detail) {
-    add(
-      shell,
-      add(el('section', 'session-canvas'), el('div', 'empty', '请在左侧选择一个会话以回放对话与时间轴')),
-      add(el('aside', 'session-inspector'), el('div', 'empty', '选择任意步骤查看详情')),
-    );
-    return shell;
-  }
-
-  const s = detail.session;
-  const steps = state.sessionSteps;
-  const currentIdx = Math.min(
-    Math.max(0, state.sessionStepSelection[s.id] ?? 0),
-    Math.max(0, steps.length - 1),
-  );
-  const activeStep = steps[currentIdx] || null;
+  const pager = el('div', 'session-pager');
+  add(shell, add(el('aside', 'session-sidebar'), head, listWrap, pager));
 
   const canvas = el('section', 'session-canvas');
-  const cHead = add(
+  const inspector = el('aside', 'session-inspector');
+  add(shell, canvas, inspector);
+  state.sessionDom = {
+    shell,
+    title,
+    searchInput,
+    harnessSelect,
+    listWrap,
+    pager,
+    canvas,
+    inspector,
+    scroll: null,
+  };
+  return shell;
+}
+
+async function importSessions() {
+  try {
+    await api('/api/import', { method: 'POST', body: '{}' });
+    toast('已完成本机原生会话增量导入');
+    state.sessionLoadedId = null;
+    await refresh();
+  } catch (err) {
+    showError(err);
+  }
+}
+
+// "13:05:09" today, otherwise "11/09 13:05" so an old session does not look like today's.
+function listDate(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toDateString() === new Date().toDateString()
+    ? timeOnly(ts)
+    : d.toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+}
+
+function renderSessionList() {
+  const dom = state.sessionDom;
+  const list = state.sessionListData || { total: 0, items: [] };
+  dom.title.textContent = `会话 · ${num(list.total)}`;
+  // Jumping here from a request clears the filters; show that in the mounted controls.
+  if (dom.searchInput.value !== state.sessionSearch) {
+    dom.searchInput.value = state.sessionSearch;
+  }
+  dom.harnessSelect.value = state.sessionHarness;
+  const top = dom.listWrap.scrollTop;
+  dom.listWrap.replaceChildren();
+  if (!list.items.length) {
+    add(
+      dom.listWrap,
+      el(
+        'div',
+        'empty',
+        state.sessionSearch || state.sessionHarness
+          ? '没有匹配的会话。'
+          : '暂无本机会话。后台每 15 秒只读检查 pi / OpenCode / Claude Code 轨迹。',
+      ),
+    );
+  }
+  for (const s of list.items) {
+    const item = el('button', `session-card ${s.id === state.selectedSessionId ? 'selected' : ''}`);
+    item.type = 'button';
+    item.dataset.sessionId = s.id;
+    const cov =
+      s.coverage === 'native'
+        ? pill('原生轨迹', '')
+        : s.coverage === 'partial'
+          ? pill('含解析异常', 'warn')
+          : pill('仅网关请求', 'neutral');
+    add(
+      item,
+      add(
+        el('div', 'session-card-top'),
+        el('span', 'session-card-title', s.title || s.native_id),
+        el('span', 'session-card-time', listDate(s.updated)),
+      ),
+      add(
+        el('div', 'session-card-sub'),
+        el('span', '', harnessLabel(s.harness)),
+        el('span', '', `${num(s.events)} 事件`),
+        el('span', '', `${num(s.requests)} 请求`),
+        cov,
+      ),
+    );
+    item.addEventListener('click', () => selectSession(s.id));
+    add(dom.listWrap, item);
+  }
+  dom.listWrap.scrollTop = top;
+  dom.pager.replaceChildren();
+  if (list.total > 50) {
+    add(
+      dom.pager,
+      paginationEl(state.sessionOffset, list.total, 50, (next) => {
+        state.sessionOffset = next;
+        refresh();
+      }),
+    );
+  }
+}
+
+function selectSession(id) {
+  state.sessionJump = null;
+  const current = [state.sessionLoadedId, state.sessionLoadingId];
+  if (state.selectedSessionId === id && current.includes(id)) return;
+  state.selectedSessionId = id;
+  for (const card of state.sessionDom.listWrap.children) {
+    card.classList.toggle('selected', card.dataset.sessionId === id);
+  }
+  loadSessionEvents();
+}
+
+async function loadSessionEvents({ resume = false } = {}) {
+  const token = ++state.sessionLoadToken;
+  const id = state.selectedSessionId;
+  // Only a newer load, another session or another page may cut this one short. An unrelated
+  // refresh (a search keystroke, the refresh button) must not truncate it.
+  const stale = () =>
+    token !== state.sessionLoadToken ||
+    state.selectedSessionId !== id ||
+    state.page !== 'sessions';
+  let detail = resume ? state.sessionDetailData : null;
+  let first = detail ? detail.events.length : 0;
+  const last = first + (resume ? 500 : SESSION_EVENT_CAP);
+  if (!resume) {
+    state.sessionLoadedId = null;
+    state.sessionDetailData = null;
+    state.sessionSteps = [];
+  }
+  state.sessionError = null;
+  state.sessionLoadingId = id;
+  renderSessionCanvas();
+  renderSessionInspector();
+  if (!id) {
+    state.sessionLoadingId = null;
+    return;
+  }
+  // The re-render replaces the "加载更多" button; keep keyboard focus on it.
+  const refocus = document.activeElement?.classList.contains('session-more-btn');
+  try {
+    let pages = 0;
+    // Paint after the first page, then once more when the remaining pages are in.
+    while (first < last) {
+      const page = await api('/api/sessions/' + encodeURIComponent(id) + '?offset=' + first);
+      if (stale()) return;
+      detail = { ...page, events: (detail?.events || []).concat(page.events) };
+      first += page.events.length;
+      pages += 1;
+      state.sessionLoadedId = id;
+      state.sessionDetailData = detail;
+      state.sessionSteps = buildSessionSteps(detail);
+      if (pages === 1) renderSessionCanvas({ keepScroll: resume });
+      if (!page.events.length || first >= page.total_events) break;
+    }
+    renderSessionCanvas({ keepScroll: resume || pages > 1 });
+  } catch (err) {
+    if (stale()) return;
+    if (state.sessionDetailData) {
+      // Part of the history is already on screen; say that the rest failed to load.
+      showError(err);
+    } else {
+      state.sessionError = err?.message || String(err);
+    }
+    renderSessionCanvas({ keepScroll: resume });
+  } finally {
+    // A superseding load has taken ownership of this field.
+    if (token === state.sessionLoadToken) state.sessionLoadingId = null;
+  }
+  if (refocus) state.sessionDom.canvas.querySelector('.session-more-btn')?.focus();
+}
+
+function renderSessionCanvas({ keepScroll = false } = {}) {
+  const dom = state.sessionDom;
+  const top = dom.scroll?.scrollTop || 0;
+  const detail = state.sessionDetailData;
+  const s = detail?.session;
+  const steps = state.sessionSteps;
+  dom.canvas.replaceChildren();
+  dom.scroll = null;
+  if (!state.selectedSessionId) {
+    add(dom.canvas, el('div', 'empty session-fill', '请在左侧选择一个会话以回放对话与时间轴'));
+    return;
+  }
+  if (!s) {
+    const fill = add(
+      el('div', 'empty session-fill'),
+      el('div', '', state.sessionError || '正在载入会话…'),
+    );
+    if (state.sessionError) {
+      add(
+        fill,
+        add(el('div', 'session-retry'), btn('重试', 'btn btn-sm', () => loadSessionEvents())),
+      );
+    }
+    add(dom.canvas, fill);
+    return;
+  }
+  const head = add(
     el('div', 'session-canvas-head'),
     add(
-      el('div'),
+      el('div', 'session-canvas-meta'),
       el('strong', '', s.title || s.native_id),
-      el('div', 'small-note', `${HARNESS_LABELS[s.harness] || s.harness} · ${s.native_id}${s.cwd ? ' · ' + s.cwd : ''}`),
+      el(
+        'div',
+        'small-note',
+        `${harnessLabel(s.harness)} · ${s.native_id}${s.cwd ? ' · ' + s.cwd : ''}`,
+      ),
     ),
     add(
       el('div', 'vendor-meta'),
-      pill(`${steps.length} 步骤`, 'neutral'),
-      pill(`${detail.requests.length} 个网关请求`, ''),
+      pill(`${num(steps.length)} 步骤`, 'neutral'),
+      pill(`${num(detail.requests.length)} 个网关请求`, 'neutral'),
+      btn('步骤详情', 'btn btn-sm inspector-toggle', toggleInspectorDrawer),
     ),
   );
-
   const tabs = el('div', 'session-canvas-tabs');
   tabs.setAttribute('role', 'tablist');
   for (const [id, label] of [
     ['conversation', '对话回放'],
     ['timeline', '时间轴瀑布'],
   ]) {
-    const tBtn = btn(label, `tab-btn ${state.sessionView === id ? 'active' : ''}`, () => {
-      state.sessionView = id;
-      refreshSessionViewOnly();
-    });
-    tBtn.setAttribute('role', 'tab');
-    tBtn.setAttribute('aria-selected', String(state.sessionView === id));
-    add(tabs, tBtn);
+    const tab = btn(label, `tab-btn ${state.sessionView === id ? 'active' : ''}`, () =>
+      setSessionView(id),
+    );
+    tab.dataset.view = id;
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', String(state.sessionView === id));
+    add(tabs, tab);
   }
-
   const scroll = el('div', 'session-scroll');
+  renderSessionScroll(scroll);
+  add(dom.canvas, head, tabs, scroll);
+  if (detail.total_events > detail.events.length) {
+    add(
+      dom.canvas,
+      add(
+        el('div', 'session-more'),
+        el(
+          'span',
+          'small-note',
+          `已加载 ${num(detail.events.length)} / ${num(detail.total_events)} 个事件`,
+        ),
+        btn('加载更多', 'btn btn-sm session-more-btn', () => loadSessionEvents({ resume: true })),
+      ),
+    );
+  }
+  dom.scroll = scroll;
+  updateStepSelection({ scroll: !keepScroll });
+  if (keepScroll) {
+    scroll.scrollTop = top;
+  } else if (state.sessionStepSelection[state.selectedSessionId] == null) {
+    // A remembered selection has just been scrolled into view; do not pull the pane back.
+    scroll.scrollTop = 0;
+  }
+}
+
+function renderSessionScroll(scroll) {
+  const steps = state.sessionSteps;
   if (!steps.length) {
     add(scroll, el('div', 'empty', '该会话暂无可展示的事件或请求。'));
-  } else if (state.sessionView === 'conversation') {
-    for (let i = 0; i < steps.length; i++) {
-      const st = steps[i];
-      const isSelected = i === currentIdx;
-      const card = el(
-        'article',
-        `step-card ${isSelected ? 'selected' : ''} ${st.status === 'failed' ? 'is-error' : ''}`,
-      );
-      card.dataset.stepIndex = String(i);
-      const sHead = add(
-        el('div', 'step-head'),
-        el('span', 'step-num', st.index),
-        el('strong', '', st.title),
-        st.model ? pill(st.model, 'neutral') : null,
-        st.kind === 'tool' ? pill('耗时未采集 —', 'neutral') : null,
-        el('span', 'small-note', timeOnly(st.timestamp)),
-      );
-      if (st.linkedRequest) {
-        add(
-          sHead,
-          pill(
-            `输入 ${num(st.linkedRequest.input)} / 输出 ${num(st.linkedRequest.output)}`,
-            '',
-          ),
-        );
-      }
-      const body = el('div', 'step-body-text', st.text || '（无正文内容，见右侧原始事件）');
-      add(card, sHead, body);
-      card.addEventListener('click', () => {
-        state.sessionStepSelection[s.id] = i;
-        refreshSessionViewOnly();
-      });
-      add(scroll, card);
-    }
-  } else {
-    const minTs = Math.min(...steps.map((x) => x.timestamp || 0));
-    const maxTs = Math.max(...steps.map((x) => x.timestamp || 0));
-    const spanMs = Math.max(1, maxTs - minTs);
-    const wf = el('div', 'waterfall-list');
-    for (let i = 0; i < steps.length; i++) {
-      const st = steps[i];
-      const item = el('div', `waterfall-item ${i === currentIdx ? 'selected' : ''}`);
-      item.addEventListener('click', () => {
-        state.sessionStepSelection[s.id] = i;
-        refreshSessionViewOnly();
-      });
+    return;
+  }
+  if (state.sessionView === 'timeline') {
+    const stamps = steps.map((x) => x.timestamp || 0);
+    const minTs = stamps.reduce((a, b) => Math.min(a, b), Infinity);
+    const spanMs = Math.max(1, stamps.reduce((a, b) => Math.max(a, b), -Infinity) - minTs);
+    add(
+      scroll,
+      el('p', 'small-note', '按本机记录时间戳绘制事件先后顺序；未采集起止时间的工具事件不伪造耗时。'),
+    );
+    const list = el('div', 'waterfall-list');
+    steps.forEach((st, i) => {
+      const item = el('div', 'waterfall-item');
+      item.dataset.stepIndex = String(i);
+      item.addEventListener('click', () => selectSessionStep(i, { openDrawer: true }));
       add(
         item,
         el('div', 'small-note', `#${st.index} ${st.title}`),
         waterfallBarSvg(st, minTs, spanMs),
-        el('span', 'small-note mono', `+${ms(st.timestamp - minTs)}`),
+        el('span', 'small-note mono', `+${dur(st.timestamp - minTs)}`),
       );
-      add(wf, item);
-    }
-    add(
-      scroll,
-      el('p', 'small-note', '按本机记录时间戳绘制事件先后顺序；未采集起止时间的工具事件不伪造耗时。'),
-      wf,
-    );
+      add(list, item);
+    });
+    add(scroll, list);
+    return;
   }
-  add(canvas, cHead, tabs, scroll);
-  add(shell, canvas);
-
-  // Right Pane: Step Inspector
-  const inspector = el('aside', 'session-inspector');
-  if (!activeStep) {
-    add(inspector, el('div', 'empty', '暂无可检视步骤'));
-  } else {
-    const iHead = add(
-      el('div', 'inspector-head'),
-      el('h3', '', `步骤 ${activeStep.index} · ${activeStep.title}`),
-      add(
-        el('div', 'provider-actions'),
-        btn('←', 'btn btn-sm', () => {
-          if (currentIdx > 0) {
-            state.sessionStepSelection[s.id] = currentIdx - 1;
-            refreshSessionViewOnly();
-          }
-        }),
-        btn('→', 'btn btn-sm', () => {
-          if (currentIdx < steps.length - 1) {
-            state.sessionStepSelection[s.id] = currentIdx + 1;
-            refreshSessionViewOnly();
-          }
-        }),
-      ),
+  for (let i = 0; i < steps.length; i++) {
+    const st = steps[i];
+    const card = el('article', `step-card ${st.status === 'failed' ? 'is-error' : ''}`);
+    card.dataset.stepIndex = String(i);
+    const head = add(
+      el('div', 'step-head'),
+      el('span', 'step-num', st.index),
+      el('strong', '', st.title),
+      st.model ? pill(st.model, 'neutral') : null,
+      st.attempts.length ? pill(`此前尝试 ${st.attempts.length} 次`, 'warn') : null,
+      st.status === 'untracked' ? pill(STATUS_LABELS.untracked, 'neutral') : null,
+      el('span', 'small-note', listDate(st.timestamp)),
     );
-    const iTabs = el('div', 'inspector-tabs');
-    for (const [id, label] of [
-      ['request', '详情与关联'],
-      ['output', '文本内容'],
-      ['raw', '原始事件'],
-    ]) {
+    if (st.linkedRequest) {
+      const lr = st.linkedRequest;
       add(
-        iTabs,
-        btn(label, `tab-btn ${state.inspectorTab === id ? 'active' : ''}`, () => {
-          state.inspectorTab = id;
-          refreshSessionViewOnly();
-        }),
+        head,
+        pill(
+          `输入 ${num(lr.input)} / 输出 ${num(lr.output)}`,
+          lr.status === 'success' ? '' : 'warn',
+        ),
       );
     }
-    const iBody = el('div', 'inspector-body');
-    if (state.inspectorTab === 'request') {
-      const kv = el('dl', 'kv-list');
-      add(kv, el('dt', '', '时间'), el('dd', 'mono', dateStr(activeStep.timestamp)));
-      add(kv, el('dt', '', '角色 / 类型'), el('dd', '', activeStep.role));
-      add(kv, el('dt', '', '状态'), add(el('dd'), statusPill(activeStep.status)));
-      if (activeStep.linkedRequest) {
-        const lr = activeStep.linkedRequest;
-        add(kv, el('dt', '', '模型'), el('dd', 'mono', lr.model || '—'));
-        add(kv, el('dt', '', '输入 / 输出'), el('dd', 'mono', `${num(lr.input)} / ${num(lr.output)}`));
-        add(kv, el('dt', '', '缓存读 / 写'), el('dd', 'mono', `${num(lr.cache_read)} / ${num(lr.cache_write)}`));
-      }
-      add(iBody, kv);
-      if (activeStep.requestId) {
-        add(
-          iBody,
-          btn('查看完整网关请求详情 →', 'btn btn-primary btn-sm', () =>
-            openRequestDetail(activeStep.requestId),
-          ),
-        );
-      }
-      add(iBody, el('pre', 'code-block', activeStep.text || '—'));
-    } else if (state.inspectorTab === 'output') {
-      add(
-        iBody,
-        btn('复制内容', 'btn btn-sm', () => copyText(activeStep.text || '')),
-        el('pre', 'code-block', activeStep.text || '（无文本输出）'),
-      );
-    } else {
-      const rawJson = JSON.stringify(activeStep.raw, null, 2);
-      add(
-        iBody,
-        btn('复制原始 JSON', 'btn btn-sm', () => copyText(rawJson)),
-        el('pre', 'code-block', rawJson),
-      );
-    }
-    add(inspector, iHead, iTabs, iBody);
+    add(card, head, el('div', 'step-body-text', st.text || '（无正文内容，见右侧原始事件）'));
+    card.addEventListener('click', () => selectSessionStep(i, { scroll: false, openDrawer: true }));
+    add(scroll, card);
   }
-  add(shell, inspector);
-  return shell;
 }
 
-function refreshSessionViewOnly() {
-  if (state.page !== 'sessions') return;
-  const content = $('#content');
-  content.className = 'stage-content sessions-mode';
-  content.replaceChildren(renderSessionWorkspace());
+function currentStepIndex() {
+  const steps = state.sessionSteps;
+  const chosen = state.sessionStepSelection[state.selectedSessionId] ?? 0;
+  return Math.min(Math.max(0, chosen), Math.max(0, steps.length - 1));
+}
+
+// Selection only flips a class and re-renders the inspector; the cards keep their scroll position.
+function updateStepSelection({ scroll = false } = {}) {
+  const idx = currentStepIndex();
+  let selected = null;
+  for (const node of state.sessionDom.scroll?.querySelectorAll('[data-step-index]') || []) {
+    const on = Number(node.dataset.stepIndex) === idx;
+    node.classList.toggle('selected', on);
+    if (on) selected = node;
+  }
+  renderSessionInspector();
+  if (scroll && selected) selected.scrollIntoView({ block: 'nearest' });
+}
+
+function selectSessionStep(index, { scroll = true, openDrawer = false } = {}) {
+  const id = state.selectedSessionId;
+  if (!id || !state.sessionSteps.length) return;
+  state.sessionStepSelection[id] = Math.min(Math.max(0, index), state.sessionSteps.length - 1);
+  if (openDrawer) setInspectorDrawer(true);
+  updateStepSelection({ scroll });
+}
+
+function setSessionView(view) {
+  if (state.sessionView === view) return;
+  state.sessionView = view;
+  for (const tab of state.sessionDom.canvas.querySelectorAll('.session-canvas-tabs .tab-btn')) {
+    const on = tab.dataset.view === view;
+    tab.classList.toggle('active', on);
+    tab.setAttribute('aria-selected', String(on));
+  }
+  if (state.sessionDom.scroll) {
+    state.sessionDom.scroll.replaceChildren();
+    renderSessionScroll(state.sessionDom.scroll);
+  }
+  updateStepSelection({ scroll: true });
+}
+
+// Below 1180px the inspector becomes a drawer; wider layouts always show it.
+function setInspectorDrawer(open) {
+  state.sessionDom?.inspector.classList.toggle('mobile-open', open);
+}
+
+function toggleInspectorDrawer() {
+  setInspectorDrawer(!state.sessionDom.inspector.classList.contains('mobile-open'));
+}
+
+function renderSessionInspector() {
+  const dom = state.sessionDom;
+  const idx = currentStepIndex();
+  const step = state.sessionSteps[idx] || null;
+  dom.inspector.replaceChildren();
+  if (!step) {
+    add(dom.inspector, el('div', 'empty session-fill', '选择任意步骤查看详情'));
+    return;
+  }
+  const nav = (label, enabled, delta) => {
+    const node = btn(label, 'btn btn-sm', () => selectSessionStep(idx + delta));
+    node.disabled = !enabled;
+    node.setAttribute('aria-label', delta < 0 ? '上一步' : '下一步');
+    return node;
+  };
+  const close = btn('关闭 ✕', 'btn btn-sm inspector-close', () => setInspectorDrawer(false));
+  close.setAttribute('aria-label', '关闭步骤详情');
+  const head = add(
+    el('div', 'inspector-head'),
+    el('h3', '', `步骤 ${step.index} · ${step.title}`),
+    add(
+      el('div', 'provider-actions'),
+      nav('←', idx > 0, -1),
+      nav('→', idx < state.sessionSteps.length - 1, 1),
+      close,
+    ),
+  );
+  const tabs = el('div', 'inspector-tabs');
+  for (const [id, label] of [
+    ['request', '详情与关联'],
+    ['output', '文本内容'],
+    ['raw', '原始事件'],
+  ]) {
+    const tab = btn(label, `tab-btn ${state.inspectorTab === id ? 'active' : ''}`, () => {
+      state.inspectorTab = id;
+      renderSessionInspector();
+    });
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', String(state.inspectorTab === id));
+    add(tabs, tab);
+  }
+  const body = el('div', 'inspector-body');
+  if (state.inspectorTab === 'request') {
+    const kv = el('dl', 'kv-list');
+    add(kv, el('dt', '', '时间'), el('dd', 'mono', dateStr(step.timestamp)));
+    add(kv, el('dt', '', '角色 / 类型'), el('dd', '', step.role));
+    if (step.status) {
+      add(kv, el('dt', '', '状态'), add(el('dd'), statusPill(step.status)));
+    }
+    if (step.linkedRequest) {
+      const lr = step.linkedRequest;
+      add(kv, el('dt', '', '模型'), el('dd', 'mono', lr.model || '—'));
+      add(kv, el('dt', '', '输入 / 输出'), el('dd', 'mono', `${num(lr.input)} / ${num(lr.output)}`));
+      add(
+        kv,
+        el('dt', '', '缓存读 / 写'),
+        el('dd', 'mono', `${num(lr.cache_read)} / ${num(lr.cache_write)}`),
+      );
+    }
+    add(body, kv);
+    step.attempts.forEach((attempt, n) => {
+      add(
+        body,
+        add(
+          el('div', 'attempt-row'),
+          pill(`此前第 ${n + 1} 次尝试`, 'neutral'),
+          statusPill(attempt.status),
+          btn('查看请求', 'link-btn', () => openRequestDetail(attempt.id)),
+        ),
+      );
+    });
+    if (step.requestId) {
+      add(
+        body,
+        btn('查看完整网关请求详情 →', 'btn btn-primary btn-sm', () =>
+          openRequestDetail(step.requestId),
+        ),
+      );
+    }
+    if (step.status === 'untracked') {
+      add(body, el('p', 'small-note', '没有与之对应的网关请求：这一步不是经 Loom 发出的，不计入调用统计。'));
+    }
+  } else if (state.inspectorTab === 'output') {
+    add(
+      body,
+      btn('复制内容', 'btn btn-sm', () => copyText(step.text || '')),
+      el('pre', 'code-block', step.text || '（无文本输出）'),
+    );
+  } else {
+    const rawJson = JSON.stringify(step.raw, null, 2);
+    add(
+      body,
+      btn('复制原始 JSON', 'btn btn-sm', () => copyText(rawJson)),
+      el('pre', 'code-block', rawJson),
+    );
+  }
+  add(dom.inspector, head, tabs, body);
 }
 
 async function renderSessions() {
+  const generation = state.generation;
   const list = await api(
     '/api/sessions?' +
       qs({
@@ -1849,26 +2287,29 @@ async function renderSessions() {
         offset: state.sessionOffset,
       }),
   );
+  if (generation !== state.generation) return null;
   state.sessionListData = list;
-  if (list.items.length) {
-    const exists = list.items.some((s) => s.id === state.selectedSessionId);
-    if (!exists) {
-      state.selectedSessionId = list.items[0].id;
-    }
-  } else {
-    state.selectedSessionId = null;
-    state.sessionDetailData = null;
-    state.sessionSteps = [];
+  // Fall back to the first row unless the user jumped here from one specific request.
+  const visible = list.items.some((s) => s.id === state.selectedSessionId);
+  const jumped = state.sessionJump != null && state.sessionJump === state.selectedSessionId;
+  if (!list.items.length) {
+    state.selectedSessionId = state.sessionJump = null;
+  } else if (!visible && !jumped) {
+    state.selectedSessionId = list.items[0].id;
   }
-
-  if (state.selectedSessionId) {
-    const detail = await api(
-      '/api/sessions/' + encodeURIComponent(state.selectedSessionId) + '?offset=0',
-    );
-    state.sessionDetailData = detail;
-    state.sessionSteps = buildSessionSteps(detail);
+  const mounted = state.sessionDom?.shell.isConnected;
+  const shell = mounted ? state.sessionDom.shell : mountSessionWorkspace();
+  renderSessionList();
+  const wanted = state.selectedSessionId;
+  if (wanted !== state.sessionLoadedId && wanted !== state.sessionLoadingId) {
+    // Not awaited: the shell mounts with a placeholder and fills in as pages arrive.
+    loadSessionEvents();
+  } else if (!mounted) {
+    renderSessionCanvas();
+    renderSessionInspector();
   }
-  return renderSessionWorkspace();
+  // Already on screen: the panes were updated in place, so there is nothing to swap in.
+  return mounted ? null : shell;
 }
 
 /* ==================== 7. 采集与保留设置 Settings ==================== */
@@ -1965,7 +2406,15 @@ async function renderSettings() {
   return panel;
 }
 
-/* ==================== Router & Boot ==================== */
+const PAGE_RENDERERS = {
+  onboarding: renderOnboarding,
+  providers: renderProviders,
+  integrations: renderIntegrations,
+  overview: renderOverview,
+  requests: () => renderRequests(filters()),
+  sessions: renderSessions,
+  settings: renderSettings,
+};
 
 async function refresh() {
   if (!state.authenticated && $('#login').hidden === false) return;
@@ -1974,44 +2423,71 @@ async function refresh() {
 
   const showTopFilters = state.page === 'overview' || state.page === 'requests';
   $('#filters').hidden = !showTopFilters;
+  $('#status-field').hidden = state.page !== 'requests';
 
   try {
     if (showTopFilters && !state.groups.length) {
       const ov = await api('/api/overview?' + qs(filters()));
       syncFilterOptions(ov.groups);
     }
-    const handlers = {
-      onboarding: renderOnboarding,
-      providers: renderProviders,
-      integrations: renderIntegrations,
-      overview: () => renderOverview(filters()),
-      requests: () => renderRequests(filters()),
-      sessions: renderSessions,
-      settings: renderSettings,
-    };
-    const node = await (handlers[state.page] || renderOnboarding)();
+    // Only the setup pages read /api/setup themselves; keep the gateway pill current everywhere.
+    if (!['onboarding', 'providers', 'integrations'].includes(state.page)) {
+      loadSetup().catch(() => {});
+    }
+    const node = await (PAGE_RENDERERS[state.page] || renderOnboarding)();
     if (generation !== state.generation) return;
 
     const content = $('#content');
     content.className = state.page === 'sessions' ? 'stage-content sessions-mode' : 'stage-content';
-    content.replaceChildren(node);
+    if (node) content.replaceChildren(node);
+    // A freshly mounted workspace needs layout before its selected step can scroll into view.
+    if (node && state.page === 'sessions') updateStepSelection({ scroll: true });
     $('#updated').textContent = '更新于 ' + timeOnly(Date.now());
   } catch (err) {
     if (generation === state.generation) {
       showError(err);
+      $('#content .page-loading')?.replaceWith(
+        el('div', 'empty', '这一页没能载入，请点右上角「刷新」重试。'),
+      );
     }
   }
 }
 
-function navigate(page) {
-  state.page = PAGE_TITLES[page] ? page : 'onboarding';
+function navigate(page, { push = true } = {}) {
+  const target = PAGE_TITLES[page] ? page : 'onboarding';
+  // A failed load must not leave another page's content under the new title.
+  if (target !== state.page && state.authenticated) {
+    const content = $('#content');
+    // Drop the sessions layout before the placeholder, or it renders without padding.
+    content.className = 'stage-content';
+    content.replaceChildren(el('div', 'empty page-loading', '正在载入…'));
+  }
+  state.page = target;
   state.offset = 0;
-  $('#title').textContent = PAGE_TITLES[state.page];
+  $('#title').textContent = PAGE_TITLES[target];
   document.querySelectorAll('.rail-btn[data-page]').forEach((b) => {
-    b.classList.toggle('active', b.dataset.page === state.page);
+    const active = b.dataset.page === target;
+    b.classList.toggle('active', active);
+    b.setAttribute('aria-current', active ? 'page' : 'false');
   });
-  history.replaceState(null, '', '#' + state.page);
+  // pushState keeps Back/Forward inside the workspace; replaceState dropped that history.
+  if (location.hash !== '#' + target) {
+    history[push ? 'pushState' : 'replaceState'](null, '', '#' + target);
+  }
   refresh();
+}
+
+// A request can belong to a session outside the visible list page; load it by id instead of the first row.
+function jumpToSession(id) {
+  // From the inspector's own request dialog the target is the session already on screen.
+  const shown = state.page === 'sessions' && state.selectedSessionId === id;
+  if (shown && state.sessionLoadedId === id) return;
+  state.sessionSearch = '';
+  state.sessionHarness = '';
+  state.sessionOffset = 0;
+  state.selectedSessionId = state.sessionJump = id;
+  state.sessionLoadedId = null;
+  navigate('sessions');
 }
 
 function parseHashTarget() {
@@ -2028,7 +2504,10 @@ document.querySelectorAll('.rail-btn[data-page]').forEach((b) => {
   b.addEventListener('click', () => navigate(b.dataset.page));
 });
 
-$('#refresh').addEventListener('click', refresh);
+$('#refresh').addEventListener('click', () => {
+  state.sessionLoadedId = null; // An explicit refresh should pick up newly imported events.
+  refresh();
+});
 $('#close-detail').addEventListener('click', () => $('#detail').close());
 $('#close-provider-dialog').addEventListener('click', () => $('#provider-dialog').close());
 $('#cancel-provider-dialog').addEventListener('click', () => $('#provider-dialog').close());
@@ -2069,7 +2548,8 @@ $('#custom-provider-form').addEventListener('submit', async (ev) => {
       body: JSON.stringify(payload),
     });
     $('#provider-dialog').close();
-    toast(saved.sync_warning || '自定义厂商已保存并同步客户端');
+    if (saved.sync_warning) toast(saved.sync_warning, 'warn');
+    else toast('自定义厂商已保存并同步客户端');
     state.page = 'providers';
     navigate('providers');
   } catch (err) {
@@ -2080,7 +2560,7 @@ $('#custom-provider-form').addEventListener('submit', async (ev) => {
   }
 });
 
-for (const id of ['range', 'provider', 'model', 'harness']) {
+for (const id of ['range', 'provider', 'model', 'harness', 'status']) {
   $('#' + id).addEventListener('change', () => {
     state.offset = 0;
     refresh();
@@ -2090,27 +2570,23 @@ for (const id of ['range', 'provider', 'model', 'harness']) {
 window.addEventListener('hashchange', () => {
   const { page } = parseHashTarget();
   if (page && page !== state.page) {
-    navigate(page);
+    navigate(page, { push: false });
   }
 });
 
 window.addEventListener('keydown', (e) => {
-  if (e.target && e.target.matches('input,textarea,select')) return;
-  if (state.page === 'sessions' && e.key === '/') {
+  if (e.target?.matches?.('input,textarea,select')) return;
+  // An open dialog owns the keyboard.
+  if (document.querySelector('dialog[open]')) return;
+  if (state.page !== 'sessions' || !state.sessionDom?.shell.isConnected) return;
+  if (e.key === '/') {
     e.preventDefault();
-    $('#session-search')?.focus();
+    state.sessionDom.searchInput.focus();
   }
-  if (state.page === 'sessions' && e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-    const detail = state.sessionDetailData;
-    const steps = state.sessionSteps;
-    if (!detail || !steps.length) return;
+  if (e.key === 'Escape') setInspectorDrawer(false);
+  if (e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
     e.preventDefault();
-    const cur = state.sessionStepSelection[detail.session.id] ?? 0;
-    const next = e.key === 'ArrowDown' ? cur + 1 : cur - 1;
-    if (next >= 0 && next < steps.length) {
-      state.sessionStepSelection[detail.session.id] = next;
-      refreshSessionViewOnly();
-    }
+    selectSessionStep(currentStepIndex() + (e.key === 'ArrowDown' ? 1 : -1));
   }
 });
 
@@ -2131,7 +2607,7 @@ window.addEventListener('keydown', (e) => {
   try {
     const setup = await loadSetup();
     const target = page && PAGE_TITLES[page] ? page : setup.needs_setup ? 'onboarding' : 'overview';
-    navigate(target);
+    navigate(target, { push: false });
   } catch (err) {
     if (state.authenticated) {
       showError(err);
@@ -2140,14 +2616,17 @@ window.addEventListener('keydown', (e) => {
 })();
 
 setInterval(() => {
-  if (
-    state.authenticated &&
-    !document.hidden &&
-    !$('#detail').open &&
-    !$('#provider-dialog').open &&
-    ['overview', 'requests'].includes(state.page) &&
-    !document.activeElement?.matches('input,select,textarea')
-  ) {
-    refresh();
+  if (!state.authenticated || document.hidden || $('#detail').open || $('#provider-dialog').open) {
+    return;
+  }
+  if (['overview', 'requests'].includes(state.page)) {
+    // Leave the page alone while someone is reading a hovered chart or filling in a field.
+    const busy =
+      document.activeElement?.matches('input,select,textarea') ||
+      document.querySelector('.chart-box:hover');
+    if (!busy) refresh();
+  } else if ($('#login').hidden) {
+    // Other pages are not re-rendered behind the user; only the gateway pill must stay current.
+    loadSetup().catch(() => {});
   }
 }, 15000);

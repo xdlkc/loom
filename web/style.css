@@ -386,11 +386,13 @@ textarea:focus {
   min-width: 0;
 }
 
+/* A definite flex basis: the 0% of `flex: 1` resolves to content in the auto-height workspace. */
 .stage-content.sessions-mode {
   padding: 0;
   display: flex;
   flex-direction: column;
-  height: calc(100dvh - 64px);
+  flex: 1 1 0px;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -487,6 +489,12 @@ textarea:focus {
   background: var(--green-tint);
   color: var(--green);
   white-space: nowrap;
+}
+
+.step-head .pill {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .pill.neutral {
@@ -818,6 +826,10 @@ textarea:focus {
   cursor: pointer;
 }
 
+.inline-check input {
+  accent-color: var(--green);
+}
+
 .models-box {
   border-top: 1px solid var(--line);
   padding-top: 12px;
@@ -1000,7 +1012,7 @@ tbody tr:hover {
 /* Charts & SVG Bars (Zero inline styles) */
 .chart-svg {
   width: 100%;
-  height: 230px;
+  height: 332px;
   display: block;
 }
 
@@ -1032,32 +1044,37 @@ tbody tr:hover {
   fill: #b69a5e;
 }
 
-.legend {
+.chart-title {
+  fill: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chart-guide {
+  stroke: #a1acb7;
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+/* Invisible to the eye, but it catches hover for the readout. */
+.chart-hit {
+  fill: transparent;
+}
+
+.chart-readout {
   display: flex;
-  gap: 18px;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  min-height: 18px;
+  margin-top: 10px;
   font-size: 12px;
   color: var(--muted);
-  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
 }
 
-.legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.legend-swatch {
-  width: 12px;
-  height: 6px;
-  border-radius: 3px;
-}
-
-.legend-swatch.in {
-  background: var(--green);
-}
-
-.legend-swatch.out {
-  background: #b69a5e;
+.chart-readout strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .timing-svg {
@@ -1082,6 +1099,28 @@ tbody tr:hover {
   fill: #d06553;
 }
 
+.share {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 150px;
+  font-variant-numeric: tabular-nums;
+}
+
+.share-svg {
+  width: 72px;
+  height: 8px;
+  flex: none;
+}
+
+.svg-track-soft {
+  fill: #e6ebe8;
+}
+
+.svg-share-bar {
+  fill: var(--green-mid);
+}
+
 .waterfall-svg {
   width: 100%;
   height: 18px;
@@ -1092,6 +1131,7 @@ tbody tr:hover {
 .session-shell {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr) 360px;
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -1200,6 +1240,12 @@ tbody tr:hover {
   background: var(--surface);
 }
 
+.session-canvas-meta {
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .session-canvas-head {
   padding: 12px 20px;
   border-bottom: 1px solid var(--line);
@@ -1260,6 +1306,9 @@ tbody tr:hover {
   flex-direction: column;
   gap: 10px;
   cursor: pointer;
+  /* Long sessions skip rendering cards that are scrolled out of view. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 110px;
 }
 
 .step-card:hover {
@@ -1326,6 +1375,8 @@ tbody tr:hover {
   align-items: center;
   cursor: pointer;
   background: var(--surface);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 56px;
 }
 
 .waterfall-item.selected {
@@ -1339,6 +1390,41 @@ tbody tr:hover {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+/* The toggle and close only exist where the inspector is a drawer (max-width: 1180px). */
+.inspector-toggle,
+.inspector-close {
+  display: none;
+}
+
+.session-fill {
+  margin: auto;
+}
+
+.session-pager {
+  flex: none;
+}
+
+.session-more {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  border-top: 1px solid var(--line);
+}
+
+.attempt-row,
+.session-retry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-retry {
+  justify-content: center;
+  margin-top: 10px;
 }
 
 .inspector-head {
@@ -1525,6 +1611,14 @@ dialog::backdrop {
   z-index: 100;
 }
 
+.toast.warn {
+  background: var(--amber-fg);
+}
+
+.toast.bad {
+  background: var(--red-fg);
+}
+
 /* Responsive */
 @media (max-width: 1180px) {
   .cards {
@@ -1551,7 +1645,13 @@ dialog::backdrop {
     bottom: 0;
     width: min(380px, 92vw);
     z-index: 40;
+    border-left: 1px solid var(--line-strong);
     box-shadow: -12px 0 36px #0000001f;
+  }
+
+  .inspector-toggle,
+  .inspector-close {
+    display: inline-flex;
   }
 }
 
@@ -1614,5 +1714,24 @@ dialog::backdrop {
   }
   .waterfall-item {
     grid-template-columns: 110px minmax(0, 1fr) 64px;
+  }
+  .health-text {
+    display: none;
+  }
+  .topbar-left {
+    overflow: hidden;
+  }
+  .topbar-left h1 {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Stacked panes read better as one long page than as three nested scrollers. */
+  .stage-content.sessions-mode {
+    flex-basis: auto;
+    overflow: visible;
+  }
+  .session-inspector.mobile-open {
+    top: 0;
   }
 }

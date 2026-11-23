@@ -53,10 +53,10 @@
         <div class="topbar-left">
           <span class="crumb">Loom</span>
           <span class="crumb-sep">/</span>
-          <h1 id="title">新手向导</h1>
+          <h1 id="title" aria-live="polite">新手向导</h1>
           <span class="health-pill" id="gateway-pill">
             <span class="dot"></span>
-            <span id="gateway-pill-text">检测网关状态…</span>
+            <span id="gateway-pill-text" class="health-text">检测网关状态…</span>
           </span>
         </div>
         <div class="topbar-actions">
@@ -121,9 +121,22 @@
             <option value="unknown">未识别</option>
           </select>
         </label>
+        <label class="field-inline" id="status-field" hidden>
+          <span>状态</span>
+          <select id="status" aria-label="状态">
+            <option value="">全部状态</option>
+            <option value="success">成功</option>
+            <option value="error">全部异常</option>
+            <option value="failed">失败</option>
+            <option value="partial">不完整</option>
+            <option value="cancelled">已取消</option>
+            <option value="interrupted">服务中断</option>
+            <option value="inflight">进行中</option>
+          </select>
+        </label>
       </section>
 
-      <main class="stage-content" id="content" aria-live="polite"></main>
+      <main class="stage-content" id="content"></main>
     </div>
   </div>
 
