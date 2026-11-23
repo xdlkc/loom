@@ -104,6 +104,28 @@ fn query(uri: &axum::http::Uri) -> HashMap<String, String> {
         .map(|u| u.query_pairs().into_owned().collect())
         .unwrap_or_default()
 }
+/// `Uri::path()` arrives as sent: browsers encode the `:` in `harness:native` session ids.
+fn decode_path(raw: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let b = raw.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(high), Some(low)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(high * 16 + low);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 async fn handle(State(app): State<App>, req: Request) -> Response {
     let h = req.headers().clone();
     let path = req.uri().path().to_string();
@@ -344,7 +366,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             let operation = method.clone();
             let result=tokio::task::spawn_blocking(move ||->Result<Value>{
                 let get=|k:&str|q.get(k).map(String::as_str).unwrap_or("");
-                let f=Filter{from:get("from").parse().unwrap_or(0),to:get("to").parse().unwrap_or(i64::MAX),provider:get("provider").into(),model:get("model").into(),harness:get("harness").into(),limit:get("limit").parse().unwrap_or(50),offset:get("offset").parse().unwrap_or(0)};
+                let f=Filter{from:get("from").parse().unwrap_or(0),to:get("to").parse().unwrap_or(i64::MAX),provider:get("provider").into(),model:get("model").into(),harness:get("harness").into(),status:get("status").into(),limit:get("limit").parse().unwrap_or(50),offset:get("offset").parse().unwrap_or(0)};
                 match (operation.as_str(),route.as_str()) {
                     ("GET","/api/overview")=>store.stats(&f),
                     ("GET","/api/requests")=>store.requests(&f),
@@ -352,8 +374,8 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                     ("GET","/api/settings")=>Ok(json!({"capture_bodies":store.setting("capture_bodies",json!(true)),"retention_days":store.setting("retention_days",json!(30)),"import_sessions":store.setting("import_sessions",json!(true)),"last_import":store.setting("last_import",Value::Null),"version":env!("CARGO_PKG_VERSION"),"database_bytes":std::fs::metadata(store.dir.join("traces.sqlite3")).map(|m|m.len()).unwrap_or(0)})),
                     ("POST","/api/import")=>harness::import(&store,&home,&data),
                     ("POST","/api/prune")=>Ok(json!({"removed_requests":store.retention()?})),
-                    _ if operation=="GET"&&route.starts_with("/api/requests/")=>store.request(route.trim_start_matches("/api/requests/")),
-                    _ if operation=="GET"&&route.starts_with("/api/sessions/")=>store.session(route.trim_start_matches("/api/sessions/"),f.offset),
+                    _ if operation=="GET"&&route.starts_with("/api/requests/")=>store.request(&decode_path(route.trim_start_matches("/api/requests/"))),
+                    _ if operation=="GET"&&route.starts_with("/api/sessions/")=>store.session(&decode_path(route.trim_start_matches("/api/sessions/")),f.offset),
                     _=>Err("NOT_FOUND".into())
                 }
             }).await;
@@ -462,6 +484,23 @@ mod tests {
         }
         r.body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+    #[test]
+    fn decode_path_decodes_escapes_and_leaves_malformed_ones_alone() {
+        for (raw, decoded) in [
+            ("claude-code%3Aabc", "claude-code:abc"),
+            ("a%2Fb%20c%2Bd", "a/b c+d"),
+            ("%E4%B8%AD", "中"),
+            ("plain-id_1.2", "plain-id_1.2"),
+            ("%ZZ", "%ZZ"),
+            ("%2", "%2"),
+            ("trailing%", "trailing%"),
+            ("100%", "100%"),
+            // A truncated UTF-8 sequence cannot be restored; it becomes one replacement character.
+            ("%C3", "\u{FFFD}"),
+        ] {
+            assert_eq!(decode_path(raw), decoded, "{raw}");
+        }
     }
     #[tokio::test]
     async fn console_requires_one_time_login_same_origin_and_never_exposes_hub_key() {
@@ -810,5 +849,114 @@ mod tests {
             .unwrap();
         assert_eq!(del_res.status(), 200);
         assert!(!d.join("keys/local-custom-test.key").exists());
+    }
+
+    /// Exchanges hub.key for a console cookie the way `loom console` does.
+    async fn console_cookie(app: axum::Router, key: &str) -> String {
+        let launch = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/launch",
+                None,
+                Some(&format!("Bearer {}", key.trim())),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(launch.into_body(), 65536).await.unwrap()).unwrap();
+        let login = app
+            .oneshot(request(
+                "POST",
+                "/api/login",
+                Some("http://127.0.0.1:4320"),
+                None,
+                json!({"ticket": v["ticket"]}),
+            ))
+            .await
+            .unwrap();
+        login.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+    fn get(path: &str, cookie: &str) -> Request {
+        let mut r = request("GET", path, None, None, Value::Null);
+        r.headers_mut().insert("cookie", cookie.parse().unwrap());
+        r
+    }
+
+    #[tokio::test]
+    async fn console_decodes_percent_encoded_request_and_session_ids() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("data");
+        let h = t.path().join("home");
+        config::init(&d).unwrap();
+        let key = std::fs::read_to_string(d.join("hub.key")).unwrap();
+        let store = Store::open(&d).unwrap();
+        let state = App::new_with_home(d, h, store, 4320, 4319);
+        // Native imports use `harness:native` ids, and browsers encode `:` as %3A in a path.
+        {
+            let c = state.store.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO sessions(id,harness,native_id,started,updated) VALUES('claude-code:fixture','claude-code','fixture',1,1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO requests(id,started,status,harness,http,detail) VALUES('req:fixture',1,'success','pi',200,'{}')",
+                [],
+            )
+            .unwrap();
+        }
+        let app = router(state);
+        let cookie = console_cookie(app.clone(), &key).await;
+
+        let response = app
+            .clone()
+            .oneshot(get("/api/sessions/claude-code%3Afixture?offset=0", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(v["session"]["id"], "claude-code:fixture");
+
+        let response = app
+            .oneshot(get("/api/requests/req%3Afixture", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn console_requests_route_honours_the_status_filter() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("data");
+        let h = t.path().join("home");
+        config::init(&d).unwrap();
+        let key = std::fs::read_to_string(d.join("hub.key")).unwrap();
+        let store = Store::open(&d).unwrap();
+        let mut f = crate::telemetry::Flight::start(store.clone(), &d, &HeaderMap::new(), "openai");
+        f.headers(401);
+        f.finish(Some("UPSTREAM_401"));
+        let app = router(App::new_with_home(d, h, store, 4320, 4319));
+        let cookie = console_cookie(app.clone(), &key).await;
+        for (status, total) in [("failed", 1), ("success", 0), ("error", 1), ("", 1)] {
+            let response = app
+                .clone()
+                .oneshot(get(&format!("/api/requests?status={status}"), &cookie))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let v: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(v["total"], total, "status={status:?}");
+        }
     }
 }

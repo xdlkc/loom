@@ -296,7 +296,7 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
         let mut args = args;
         args.push(json!(f.limit.clamp(1, 200)));
         args.push(json!(f.offset.min(1000000)));
-        let mut q=c.prepare(&format!("SELECT id,started,provider,model,harness,session,status,http,duration,ttft,input,output,cache_read,cache_write FROM requests WHERE {} ORDER BY started DESC,id LIMIT ?6 OFFSET ?7",Filter::SQL))?;
+        let mut q=c.prepare(&format!("SELECT id,started,provider,model,harness,session,status,http,duration,ttft,input,output,cache_read,cache_write FROM requests WHERE {} ORDER BY started DESC,id LIMIT ?7 OFFSET ?8",Filter::SQL))?;
         let rows=q.query_map(rusqlite::params_from_iter(args.iter().map(sql_value)),|r|Ok(json!({"id":r.get::<_,String>(0)?,"started":r.get::<_,i64>(1)?,"provider":r.get::<_,Option<String>>(2)?,"model":r.get::<_,Option<String>>(3)?,"harness":r.get::<_,String>(4)?,"session":r.get::<_,Option<String>>(5)?,"status":r.get::<_,String>(6)?,"http":r.get::<_,u16>(7)?,"duration_ms":r.get::<_,Option<f64>>(8)?,"ttft_ms":r.get::<_,Option<f64>>(9)?,"input":r.get::<_,Option<i64>>(10)?,"output":r.get::<_,Option<i64>>(11)?,"cache_read":r.get::<_,Option<i64>>(12)?,"cache_write":r.get::<_,Option<i64>>(13)?})))?;
         Ok(json!({"total":count,"items":rows.collect::<std::result::Result<Vec<_>,_>>()?}))
     }
@@ -311,6 +311,12 @@ fn sql_value(v: &Value) -> rusqlite::types::Value {
         _ => rusqlite::types::Value::Null,
     }
 }
+/// The outcomes other than success, spelled once for both the filter and the aggregates.
+macro_rules! non_success {
+    () => {
+        "('failed','partial','cancelled','interrupted')"
+    };
+}
 #[derive(Clone, Deserialize)]
 pub struct Filter {
     #[serde(default)]
@@ -323,6 +329,9 @@ pub struct Filter {
     pub model: String,
     #[serde(default)]
     pub harness: String,
+    /// Exact status, or `error` for every non-success outcome; empty matches all.
+    #[serde(default)]
+    pub status: String,
     #[serde(default = "default_limit")]
     pub limit: u32,
     #[serde(default)]
@@ -342,13 +351,20 @@ impl Default for Filter {
             provider: String::new(),
             model: String::new(),
             harness: String::new(),
+            status: String::new(),
             limit: 50,
             offset: 0,
         }
     }
 }
 impl Filter {
-    const SQL: &'static str = "started>=?1 AND started<?2 AND (?3='' OR provider=?3) AND (?4='' OR model=?4) AND (?5='' OR harness=?5)";
+    const SQL: &'static str = concat!(
+        "started>=?1 AND started<?2 AND (?3='' OR provider=?3) AND (?4='' OR model=?4) ",
+        "AND (?5='' OR harness=?5) ",
+        "AND (?6='' OR (?6='error' AND status IN ",
+        non_success!(),
+        ") OR status=?6)"
+    );
     fn args(&self) -> Vec<Value> {
         vec![
             json!(self.from),
@@ -356,6 +372,7 @@ impl Filter {
             json!(self.provider),
             json!(self.model),
             json!(self.harness),
+            json!(self.status),
         ]
     }
 }
@@ -542,31 +559,226 @@ impl Drop for Flight {
     }
 }
 
+const HOUR: i64 = 3600000;
+const DAY: i64 = 24 * HOUR;
+/// UTC offsets are multiples of 15 minutes, so quarter hours never straddle a local day or hour.
+const FINEST: i64 = 15 * 60000;
+/// A bounded window wider than this keeps only the buckets that hold data instead of being zero-filled.
+const MAX_BUCKETS: usize = 2000;
+/// Aggregate column order shared by summary, group and series rows; see `Bucket::of_row`.
+const AGGREGATE: &str = concat!(
+    "COUNT(*),SUM(status='success'),SUM(status IN ",
+    non_success!(),
+    "),SUM(input),SUM(output),SUM(cache_read),SUM(cache_write),SUM(reasoning),",
+    "SUM(input IS NOT NULL AND output IS NOT NULL),SUM(cache_read IS NOT NULL),",
+    "SUM(CASE WHEN cache_read IS NOT NULL THEN input END),",
+    "SUM(duration),COUNT(duration),SUM(ttft),COUNT(ttft)"
+);
+
+/// One group of requests. `None` totals mean no request in the group reported usage; they are
+/// never turned into zero, because unknown usage must stay unknown.
+#[derive(Default, Clone, Copy)]
+struct Bucket {
+    requests: i64,
+    success: i64,
+    errors: i64,
+    input: Option<i64>,
+    output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+    reasoning: Option<i64>,
+    usage_observed: i64,
+    cache_observed: i64,
+    cache_base: Option<i64>,
+    duration_sum: f64,
+    duration_count: i64,
+    ttft_sum: f64,
+    ttft_count: i64,
+}
+impl Bucket {
+    /// Reads the `AGGREGATE` columns starting at `base`.
+    fn of_row(r: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Self> {
+        let count = |i: usize| r.get::<_, Option<i64>>(base + i).map(|n| n.unwrap_or(0));
+        let total = |i: usize| r.get::<_, Option<i64>>(base + i);
+        let time = |i: usize| r.get::<_, Option<f64>>(base + i);
+        Ok(Self {
+            requests: count(0)?,
+            success: count(1)?,
+            errors: count(2)?,
+            input: total(3)?,
+            output: total(4)?,
+            cache_read: total(5)?,
+            cache_write: total(6)?,
+            reasoning: total(7)?,
+            usage_observed: count(8)?,
+            cache_observed: count(9)?,
+            cache_base: total(10)?,
+            duration_sum: time(11)?.unwrap_or(0.0),
+            duration_count: count(12)?,
+            ttft_sum: time(13)?.unwrap_or(0.0),
+            ttft_count: count(14)?,
+        })
+    }
+    /// A time range without requests is known to be zero, which differs from `Default` (unknown).
+    fn zero() -> Self {
+        Self {
+            input: Some(0),
+            output: Some(0),
+            cache_read: Some(0),
+            cache_write: Some(0),
+            reasoning: Some(0),
+            cache_base: Some(0),
+            ..Self::default()
+        }
+    }
+    fn merge(self, later: Self) -> Self {
+        fn sum(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            }
+        }
+        Self {
+            requests: self.requests + later.requests,
+            success: self.success + later.success,
+            errors: self.errors + later.errors,
+            input: sum(self.input, later.input),
+            output: sum(self.output, later.output),
+            cache_read: sum(self.cache_read, later.cache_read),
+            cache_write: sum(self.cache_write, later.cache_write),
+            reasoning: sum(self.reasoning, later.reasoning),
+            usage_observed: self.usage_observed + later.usage_observed,
+            cache_observed: self.cache_observed + later.cache_observed,
+            cache_base: sum(self.cache_base, later.cache_base),
+            duration_sum: self.duration_sum + later.duration_sum,
+            duration_count: self.duration_count + later.duration_count,
+            ttft_sum: self.ttft_sum + later.ttft_sum,
+            ttft_count: self.ttft_count + later.ttft_count,
+        }
+    }
+    fn json(self, timestamp: Option<i64>) -> Value {
+        let mean = |sum: f64, n: i64| (n > 0).then(|| sum / n as f64);
+        let mut v = json!({
+            "requests": self.requests,
+            "success": self.success,
+            "errors": self.errors,
+            "input_tokens": self.input,
+            "output_tokens": self.output,
+            "cache_read_tokens": self.cache_read,
+            "cache_write_tokens": self.cache_write,
+            "reasoning_tokens": self.reasoning,
+            "usage_observed": self.usage_observed,
+            "cache_observed": self.cache_observed,
+            // Token-weighted: cached tokens over the prompt tokens of requests that reported a cache.
+            "cache_hit_rate": self
+                .cache_read
+                .zip(self.cache_base)
+                .filter(|(_, d)| *d > 0)
+                .map(|(n, d)| n as f64 / d as f64),
+            "avg_duration_ms": mean(self.duration_sum, self.duration_count),
+            "avg_ttft_ms": mean(self.ttft_sum, self.ttft_count),
+        });
+        if let Some(ts) = timestamp {
+            v["timestamp"] = json!(ts);
+        }
+        v
+    }
+}
+fn local_date(ts: i64) -> chrono::NaiveDate {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(ts)
+        .single()
+        .map(|t| t.date_naive())
+        .unwrap_or_default()
+}
+/// Local midnight where it exists; a day that starts inside a DST gap begins at 01:00.
+fn day_start(date: chrono::NaiveDate) -> i64 {
+    use chrono::{Local, LocalResult, TimeZone};
+    let first = |hour| {
+        date.and_hms_opt(hour, 0, 0)
+            .and_then(|t| match Local.from_local_datetime(&t) {
+                LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.timestamp_millis()),
+                LocalResult::None => None,
+            })
+    };
+    first(0).or_else(|| first(1)).unwrap_or(0)
+}
+fn next_day_start(start: i64) -> i64 {
+    // Step by calendar date: on a 25-hour day, start + 24h is still the same local date.
+    local_date(start)
+        .succ_opt()
+        .map(day_start)
+        .unwrap_or_else(|| start.saturating_add(DAY))
+}
+/// Aggregates quarter-hour rows into the bucket size that fits the window; narrow bounded
+/// windows are zero-filled so gaps read as zero rather than as missing points.
+fn resample(fine: Vec<(i64, Bucket)>, f: &Filter) -> (Vec<Value>, i64) {
+    let span = f.to.saturating_sub(f.from);
+    let bucket = if span > 10 * DAY {
+        DAY
+    } else if span > 3 * DAY {
+        6 * HOUR
+    } else {
+        HOUR
+    };
+    let start_of = |ts| {
+        if bucket == DAY {
+            day_start(local_date(ts))
+        } else {
+            ts / bucket * bucket
+        }
+    };
+    let next = |ts| {
+        if bucket == DAY {
+            next_day_start(ts)
+        } else {
+            ts.saturating_add(bucket)
+        }
+    };
+    let mut merged: Vec<(i64, Bucket)> = Vec::new();
+    for (ts, b) in fine {
+        let key = start_of(ts);
+        if let Some((_, acc)) = merged.last_mut().filter(|(k, _)| *k == key) {
+            *acc = acc.merge(b);
+        } else {
+            merged.push((key, b));
+        }
+    }
+    if f.to == i64::MAX || f.from >= f.to || span / bucket > MAX_BUCKETS as i64 {
+        let series = merged.into_iter().map(|(t, b)| b.json(Some(t))).collect();
+        return (series, bucket);
+    }
+    let (mut series, mut cursor, mut i) = (Vec::new(), start_of(f.from), 0);
+    while cursor < f.to && series.len() < MAX_BUCKETS {
+        let b = match merged.get(i) {
+            Some((t, b)) if *t == cursor => {
+                i += 1;
+                *b
+            }
+            _ => Bucket::zero(),
+        };
+        series.push(b.json(Some(cursor)));
+        cursor = next(cursor);
+    }
+    (series, bucket)
+}
+
 impl Store {
     pub fn stats(&self, f: &Filter) -> Result<Value> {
         let c = self.conn.lock().map_err(|_| "trace lock poisoned")?;
         let args = f.args();
-        let aggregate = "COUNT(*),SUM(status='success'),SUM(status IN ('failed','partial','cancelled','interrupted')),SUM(input),SUM(output),SUM(cache_read),SUM(cache_write),SUM(reasoning),SUM(input IS NOT NULL AND output IS NOT NULL),SUM(cache_read IS NOT NULL),SUM(CASE WHEN cache_read IS NOT NULL THEN input END),AVG(duration),AVG(ttft)";
-        fn metrics(r: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Value> {
-            let n = |i| r.get::<_, Option<i64>>(base + i);
-            let requests = n(0)?.unwrap_or(0);
-            let cached = n(5)?;
-            let denominator = n(10)?;
-            Ok(
-                json!({"requests":requests,"success":n(1)?.unwrap_or(0),"errors":n(2)?.unwrap_or(0),"input_tokens":n(3)?,"output_tokens":n(4)?,"cache_read_tokens":cached,"cache_write_tokens":n(6)?,"reasoning_tokens":n(7)?,"usage_observed":n(8)?.unwrap_or(0),"cache_observed":n(9)?.unwrap_or(0),"cache_hit_rate":cached.zip(denominator).filter(|(_,d)|*d>0).map(|(n,d)|n as f64/d as f64),"avg_duration_ms":r.get::<_,Option<f64>>(base+11)?,"avg_ttft_ms":r.get::<_,Option<f64>>(base+12)?}),
-            )
-        }
         let summary = c.query_row(
-            &format!("SELECT {aggregate} FROM requests WHERE {}", Filter::SQL),
+            &format!("SELECT {AGGREGATE} FROM requests WHERE {}", Filter::SQL),
             rusqlite::params_from_iter(args.iter().map(sql_value)),
-            |r| metrics(r, 0),
+            |r| Ok(Bucket::of_row(r, 0)?.json(None)),
         )?;
-        let mut q=c.prepare(&format!("SELECT provider,model,harness,{aggregate} FROM requests WHERE {} GROUP BY provider,model,harness ORDER BY SUM(COALESCE(input,0)+COALESCE(output,0)) DESC",Filter::SQL))?;
+        let mut q=c.prepare(&format!("SELECT provider,model,harness,{AGGREGATE} FROM requests WHERE {} GROUP BY provider,model,harness ORDER BY SUM(COALESCE(input,0)+COALESCE(output,0)) DESC",Filter::SQL))?;
         let groups = q
             .query_map(
                 rusqlite::params_from_iter(args.iter().map(sql_value)),
                 |r| {
-                    let mut v = metrics(r, 3)?;
+                    let mut v = Bucket::of_row(r, 3)?.json(None);
                     v["provider"] = json!(r.get::<_, Option<String>>(0)?);
                     v["model"] = json!(r.get::<_, Option<String>>(1)?);
                     v["harness"] = json!(r.get::<_, String>(2)?);
@@ -574,22 +786,14 @@ impl Store {
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let bucket = if f.to.saturating_sub(f.from) > 3 * 86400000 {
-            86400000
-        } else {
-            3600000
-        };
-        let mut q=c.prepare(&format!("SELECT (started/{bucket})*{bucket},{aggregate} FROM requests WHERE {} GROUP BY 1 ORDER BY 1",Filter::SQL))?;
-        let series = q
+        let mut q=c.prepare(&format!("SELECT (started/{FINEST})*{FINEST},{AGGREGATE} FROM requests WHERE {} GROUP BY 1 ORDER BY 1",Filter::SQL))?;
+        let fine = q
             .query_map(
                 rusqlite::params_from_iter(args.iter().map(sql_value)),
-                |r| {
-                    let mut v = metrics(r, 1)?;
-                    v["timestamp"] = json!(r.get::<_, i64>(0)?);
-                    Ok(v)
-                },
+                |r| Ok((r.get::<_, i64>(0)?, Bucket::of_row(r, 1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (series, bucket) = resample(fine, f);
         let mut q = c.prepare(&format!(
             "SELECT duration FROM requests WHERE {} AND duration IS NOT NULL ORDER BY duration",
             Filter::SQL
@@ -647,8 +851,8 @@ impl Store {
             })?;
         let mut q=c.prepare("SELECT id,parent,ts,kind,payload,response_id FROM events WHERE session=?1 ORDER BY ts,ordinal,id LIMIT 100 OFFSET ?2")?;
         let events=q.query_map(params![id,offset.min(1000000)],|r|Ok(json!({"id":r.get::<_,String>(0)?,"parent":r.get::<_,Option<String>>(1)?,"timestamp":r.get::<_,i64>(2)?,"kind":r.get::<_,String>(3)?,"payload":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).unwrap_or(Value::Null),"response_id":r.get::<_,Option<String>>(5)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-        let mut q=c.prepare("SELECT id,started,model,status,input,output,cache_read,cache_write FROM requests WHERE session=?1 ORDER BY started,id")?;
-        let requests=q.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"started":r.get::<_,i64>(1)?,"model":r.get::<_,Option<String>>(2)?,"status":r.get::<_,String>(3)?,"input":r.get::<_,Option<i64>>(4)?,"output":r.get::<_,Option<i64>>(5)?,"cache_read":r.get::<_,Option<i64>>(6)?,"cache_write":r.get::<_,Option<i64>>(7)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let mut q=c.prepare("SELECT id,started,model,status,input,output,cache_read,cache_write,response_id FROM requests WHERE session=?1 ORDER BY started,id")?;
+        let requests=q.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"started":r.get::<_,i64>(1)?,"model":r.get::<_,Option<String>>(2)?,"status":r.get::<_,String>(3)?,"input":r.get::<_,Option<i64>>(4)?,"output":r.get::<_,Option<i64>>(5)?,"cache_read":r.get::<_,Option<i64>>(6)?,"cache_write":r.get::<_,Option<i64>>(7)?,"response_id":r.get::<_,Option<String>>(8)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
         Ok(
             json!({"session":metadata,"events":events,"total_events":count,"offset":offset,"requests":requests}),
         )
@@ -763,11 +967,303 @@ mod tests {
         assert_eq!(s.retention().unwrap(), 1);
         assert_eq!(s.requests(&Filter::default()).unwrap()["total"], 0);
     }
+    fn place(s: &Store, id: &str, started: i64) {
+        let mut r: Record = serde_json::from_value(s.request(id).unwrap()).unwrap();
+        r.started = started;
+        r.ended = Some(started + 1000);
+        r.duration_ms = Some(1000);
+        s.save(&r).unwrap();
+    }
+    fn date(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+    fn days_ago(day: chrono::NaiveDate, n: u64) -> chrono::NaiveDate {
+        day.checked_sub_days(chrono::Days::new(n)).unwrap()
+    }
+    fn local_date(ts: i64) -> chrono::NaiveDate {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_millis_opt(ts)
+            .single()
+            .unwrap()
+            .date_naive()
+    }
+    /// Local midnight as an independent oracle; a day that starts inside a DST gap begins at 01:00.
+    fn midnight(date: chrono::NaiveDate) -> i64 {
+        use chrono::{Local, LocalResult, TimeZone};
+        let at = |hour| {
+            date.and_hms_opt(hour, 0, 0)
+                .and_then(|t| match Local.from_local_datetime(&t) {
+                    LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => {
+                        Some(t.timestamp_millis())
+                    }
+                    LocalResult::None => None,
+                })
+        };
+        at(0).or_else(|| at(1)).unwrap()
+    }
+    #[test]
+    fn series_follows_local_days_and_fills_empty_buckets() {
+        let (d, s) = fixture();
+        let end = now();
+        let today = local_date(end);
+        // Local 00:07 opens a calendar day; a UTC-aligned bucket would file it under the previous date.
+        let stamps: Vec<i64> = [(3, 1), (3, 22), (5, 12), (9, 0)]
+            .iter()
+            .map(|&(days, hour)| midnight(days_ago(today, days)) + hour * 3600000 + 7 * 60000)
+            .collect();
+        for (i, ts) in stamps.iter().enumerate() {
+            place(&s, &record(d.path(), &s, 100 * (i as u64 + 1), None), *ts);
+        }
+        let f = Filter {
+            from: midnight(days_ago(today, 20)),
+            to: end,
+            ..Filter::default()
+        };
+        let v = s.stats(&f).unwrap();
+        assert_eq!(v["bucket_ms"], 86400000);
+        let series = v["series"].as_array().unwrap();
+        assert_eq!(series.len(), 21);
+        for b in series {
+            let ts = b["timestamp"].as_i64().unwrap();
+            assert_eq!(midnight(local_date(ts)), ts);
+        }
+        for (i, ts) in stamps.iter().enumerate() {
+            let bucket = series
+                .iter()
+                .find(|b| b["timestamp"] == midnight(local_date(*ts)))
+                .unwrap();
+            assert_eq!(bucket["requests"], if i < 2 { 2 } else { 1 });
+        }
+        assert_eq!(series.iter().filter(|b| b["requests"] == 0).count(), 18);
+        assert_eq!(
+            series
+                .iter()
+                .map(|b| b["input_tokens"].as_i64().unwrap())
+                .sum::<i64>(),
+            1000
+        );
+        assert_eq!(v["summary"]["requests"], 4);
+    }
+    #[test]
+    fn series_bucket_size_follows_the_window() {
+        let (d, s) = fixture();
+        let id = record(d.path(), &s, 10, None);
+        let end = now();
+        place(&s, &id, end - 3600000);
+        for (from, bucket_ms, buckets) in [
+            (end - 24 * 3600000, 3600000, 24..=25),
+            (end - 168 * 3600000, 21600000, 28..=29),
+            (midnight(days_ago(local_date(end), 30)), 86400000, 31..=31),
+        ] {
+            let f = Filter {
+                from,
+                to: end,
+                ..Filter::default()
+            };
+            let v = s.stats(&f).unwrap();
+            assert_eq!(v["bucket_ms"], bucket_ms);
+            let series = v["series"].as_array().unwrap();
+            assert!(
+                buckets.contains(&series.len()),
+                "window from {from} produced {} buckets",
+                series.len()
+            );
+            assert!(
+                series
+                    .iter()
+                    .all(|b| b["timestamp"].as_i64().unwrap() < end)
+            );
+            assert_eq!(
+                series
+                    .iter()
+                    .map(|b| b["requests"].as_i64().unwrap())
+                    .sum::<i64>(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn series_steps_over_a_dst_fall_back_day() {
+        // chrono reads TZ once per process, so the assertions run in a child under US DST rules.
+        const NAME: &str = "telemetry::tests::series_steps_over_a_dst_fall_back_day";
+        if std::env::var_os("LOOM_TZ_PROBE").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("TZ", "EST5EDT,M3.2.0,M11.1.0")
+                .env("LOOM_TZ_PROBE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use chrono::TimeZone;
+        let offset = |day: &str| {
+            chrono::Local
+                .timestamp_millis_opt(midnight(date(day)))
+                .single()
+                .unwrap()
+                .offset()
+                .local_minus_utc()
+        };
+        if offset("2025-07-01") == offset("2025-12-01") {
+            eprintln!("TZ=EST5EDT applies no DST here, so there is nothing to assert");
+            return;
+        }
+        let (d, s) = fixture();
+        // US clocks fell back on 2025-11-02, which makes that local day 25 hours long.
+        let days = ["2025-10-31", "2025-11-01", "2025-11-02", "2025-11-03"];
+        for day in days {
+            place(
+                &s,
+                &record(d.path(), &s, 10, None),
+                midnight(date(day)) + 12 * 3600000,
+            );
+        }
+        let f = Filter {
+            from: midnight(date("2025-10-26")),
+            to: midnight(date("2025-11-07")),
+            ..Filter::default()
+        };
+        let v = s.stats(&f).unwrap();
+        let series = v["series"].as_array().unwrap();
+        assert_eq!(
+            series.len(),
+            12,
+            "a 25-hour day must still advance to the next calendar date"
+        );
+        for day in days {
+            let bucket = series
+                .iter()
+                .find(|b| b["timestamp"] == midnight(date(day)))
+                .unwrap();
+            assert_eq!(bucket["requests"], 1, "{day}");
+        }
+    }
+    #[test]
+    fn unbounded_series_stays_sparse() {
+        let (d, s) = fixture();
+        let id = record(d.path(), &s, 10, None);
+        place(&s, &id, now() - 2 * 86400000);
+        let v = s.stats(&Filter::default()).unwrap();
+        // Without a window there is no useful granularity; the unbounded API keeps calendar days.
+        assert_eq!(v["bucket_ms"], 86400000);
+        let series = v["series"].as_array().unwrap();
+        // One request two days old yields exactly one bucket, not thousands of zero-filled ones.
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0]["requests"], 1);
+    }
+    #[test]
+    fn status_filter_narrows_requests_and_stats_including_every_non_success() {
+        let (d, s) = fixture();
+        let ok = record(d.path(), &s, 10, None);
+        let mut f = Flight::start(s.clone(), d.path(), &axum::http::HeaderMap::new(), "openai");
+        f.headers(401);
+        f.finish(Some("UPSTREAM_401"));
+        let failed = f.record.id.clone();
+        let cancelled = {
+            let f = Flight::start(s.clone(), d.path(), &axum::http::HeaderMap::new(), "openai");
+            f.record.id.clone()
+        };
+        let filter = |status: &str| Filter {
+            status: status.into(),
+            ..Filter::default()
+        };
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        // A partial stream and a crash are stored statuses rather than distinct flights.
+        let relabelled = |status: &str| {
+            let id = record(d.path(), &s, 10, None);
+            let mut r: Record = serde_json::from_value(s.request(&id).unwrap()).unwrap();
+            r.status = status.into();
+            s.save(&r).unwrap();
+            id
+        };
+        let partial = relabelled("partial");
+        let interrupted = relabelled("interrupted");
+        for (status, expected, errors) in [
+            ("success", vec![ok.clone()], 0),
+            ("failed", vec![failed.clone()], 1),
+            ("partial", vec![partial.clone()], 1),
+            ("interrupted", vec![interrupted.clone()], 1),
+            ("cancelled", vec![cancelled.clone()], 1),
+            (
+                "error",
+                vec![
+                    cancelled.clone(),
+                    failed.clone(),
+                    interrupted.clone(),
+                    partial.clone(),
+                ],
+                4,
+            ),
+            (
+                "",
+                vec![
+                    cancelled.clone(),
+                    failed.clone(),
+                    interrupted.clone(),
+                    ok.clone(),
+                    partial.clone(),
+                ],
+                4,
+            ),
+        ] {
+            let v = s.requests(&filter(status)).unwrap();
+            assert_eq!(v["total"], expected.len() as i64, "status={status:?}");
+            let ids: Vec<String> = v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(sorted(ids), sorted(expected.clone()), "status={status:?}");
+            let summary = s.stats(&filter(status)).unwrap()["summary"].clone();
+            assert_eq!(summary["requests"], expected.len() as i64);
+            assert_eq!(summary["errors"], errors);
+        }
+    }
 }
 
 #[cfg(test)]
 mod correlation_tests {
     use super::*;
+    #[test]
+    fn session_detail_exposes_response_ids_for_exact_request_linking() {
+        let t = tempfile::tempdir().unwrap();
+        config::init(t.path()).unwrap();
+        let s = Store::open(t.path()).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO sessions(id,harness,native_id,started,updated) VALUES('pi:link','pi','link',1,1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO events(id,session,ts,kind,payload,response_id) VALUES('e1','pi:link',2,'assistant','{}','response_link')",
+                [],
+            )
+            .unwrap();
+        }
+        let mut f = Flight::start(s.clone(), t.path(), &axum::http::HeaderMap::new(), "openai");
+        f.request_body(
+            &json!({"model":"fixture/model","messages":[{"role":"user","content":"fixture"}]}),
+        );
+        f.headers(200);
+        f.chunk(
+            json!({"id":"response_link","usage":{"prompt_tokens":1,"completion_tokens":1},"choices":[]})
+                .to_string()
+                .as_bytes(),
+        );
+        f.finish(None);
+        let v = s.session("pi:link", 0).unwrap();
+        assert_eq!(v["events"][0]["response_id"], "response_link");
+        assert_eq!(v["requests"][0]["response_id"], "response_link");
+        assert_eq!(v["requests"][0]["id"], f.record.id);
+    }
     #[test]
     fn transcript_arriving_before_or_after_response_has_same_exact_link() {
         let t = tempfile::tempdir().unwrap();
